@@ -1,6 +1,7 @@
 {
   "name": "physiocase-backend",
   "version": "1.0.0",
+  "private": true,
   "type": "commonjs",
   "engines": {
     "node": ">=20"
@@ -9,10 +10,10 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "bcryptjs": "^3.0.3",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.3",
-    "mysql2": "^3.11.0"
+    "bcryptjs": "3.0.3",
+    "cors": "2.8.5",
+    "express": "4.19.2",
+    "jsonwebtoken": "9.0.3",
+    "mysql2": "3.11.0"
   }
 }
