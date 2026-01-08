@@ -14,13 +14,13 @@ app.use(express.json());
 
 // MySQL configuration
 const dbConfig = {
-  host: '127.0.0.1',
-  user: 'root',
-  password: 'Mazen198165967#',
+host: process.env.DB_HOST,       // ❗ NOT localhost
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  multipleStatements: true
 };
 
 // Initial connection to create DB if not exists
@@ -1189,3 +1189,4 @@ app.delete('/api/admin/categories/:id', authMiddleware('admin'), (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend API running on http://localhost:${PORT}`);
 });
+
