@@ -17,18 +17,21 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
   These MUST be set in Back4App → Environment Variables
 */
 const DB_CONFIG = {
-  host: process.env.DB_HOST,       // ❗ NOT localhost
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 26324),
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
 
-     ssl: {
-    rejectUnauthorized: true,
+  ssl: {
+    rejectUnauthorized: false,
   },
 };
+
 
 /* ======================
    MIDDLEWARE
@@ -165,4 +168,5 @@ app.post("/api/auth/login", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
