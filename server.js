@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -1175,7 +1176,7 @@ app.get('/api/leaderboard', authMiddleware(), (req, res) => {
 /* ======================
    SERVER START
 ====================== */
+console.log("DEBUG: About to listen on port " + PORT);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Backend running on port ${PORT}`);
 });
-
