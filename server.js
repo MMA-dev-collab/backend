@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -95,7 +96,7 @@ const db = {
         const cb = typeof args.at(-1) === "function" ? args.pop() : null;
         pool.query(sql, args).then(() => cb && cb()).catch(err => cb && cb(err));
       },
-      finalize() {}
+      finalize() { }
     };
   },
 
@@ -191,6 +192,237 @@ app.post("/api/auth/login", (req, res) => {
    🔥 ALL YOUR OTHER ROUTES GO HERE
    (PASTE THEM EXACTLY AS THEY ARE)
 ====================== */
+
+// SEED OPTION - REMOVE IN PRODUCTION
+app.post('/api/dev/seed', async (req, res) => {
+  try {
+    if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
+    // 1. Create Users
+    const usersData = [
+      { email: 'student1@test.com', name: 'Alice Student', role: 'student' },
+      { email: 'student2@test.com', name: 'Bob User', role: 'student' },
+      { email: 'student3@test.com', name: 'Charlie Learner', role: 'student' }
+    ];
+
+    const passwordHash = bcrypt.hashSync('password123', 10);
+    const userIds = [];
+
+    for (const u of usersData) {
+      await new Promise((resolve) => {
+        db.run(`INSERT INTO users (email, passwordHash, role, name) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)`,
+          [u.email, passwordHash, u.role, u.name],
+          function (err) {
+            if (!err && this.lastID) userIds.push(this.lastID);
+            if (this.lastID === 0) {
+              db.get(`SELECT id FROM users WHERE email = ?`, [u.email], (e, row) => {
+                if (row) userIds.push(row.id);
+                resolve();
+              });
+            } else {
+              resolve();
+            }
+          });
+      });
+    }
+
+    // 2. Create 4 Complete Cases with Steps
+    const casesData = [
+      {
+        title: 'Knee Pain Assessment',
+        difficulty: 'Beginner',
+        category: 'Orthopedics',
+        steps: [
+          {
+            type: 'info',
+            stepIndex: 0,
+            content: JSON.stringify({
+              patientName: 'John Smith',
+              age: 45,
+              gender: 'Male',
+              description: 'Patient presents with chronic knee pain',
+              chiefComplaint: 'ألم في الركبة منذ 3 أشهر'
+            })
+          },
+          {
+            type: 'mcq',
+            stepIndex: 1,
+            question: 'What is the first step in assessment?',
+            maxScore: 10,
+            options: [
+              { label: 'Order MRI immediately', isCorrect: false, feedback: 'Too aggressive for initial assessment' },
+              { label: 'Physical examination', isCorrect: true, feedback: 'Correct! Always start with physical exam' },
+              { label: 'Prescribe pain medication', isCorrect: false, feedback: 'Need assessment first' }
+            ]
+          }
+        ]
+      },
+      {
+        title: 'Chest Pain Evaluation',
+        difficulty: 'Intermediate',
+        category: 'Cardiology',
+        steps: [
+          {
+            type: 'info',
+            stepIndex: 0,
+            content: JSON.stringify({
+              patientName: 'Sarah Johnson',
+              age: 62,
+              gender: 'Female',
+              description: 'Acute chest pain radiating to left arm',
+              chiefComplaint: 'ألم في الصدر منذ ساعة'
+            })
+          },
+          {
+            type: 'mcq',
+            stepIndex: 1,
+            question: 'What is the most urgent action?',
+            maxScore: 15,
+            options: [
+              { label: 'ECG and cardiac markers', isCorrect: true, feedback: 'Correct! Rule out MI immediately' },
+              { label: 'Schedule stress test', isCorrect: false, feedback: 'Too slow for acute presentation' },
+              { label: 'Give antacids', isCorrect: false, feedback: 'Dangerous assumption' }
+            ]
+          }
+        ]
+      },
+      {
+        title: 'Pediatric Fever Management',
+        difficulty: 'Intermediate',
+        category: 'Pediatrics',
+        steps: [
+          {
+            type: 'info',
+            stepIndex: 0,
+            content: JSON.stringify({
+              patientName: 'Emma Davis',
+              age: 3,
+              gender: 'Female',
+              description: 'High fever 39.5°C for 2 days',
+              chiefComplaint: 'حمى عالية منذ يومين'
+            })
+          },
+          {
+            type: 'mcq',
+            stepIndex: 1,
+            question: 'What is the priority assessment?',
+            maxScore: 12,
+            options: [
+              { label: 'Check for meningeal signs', isCorrect: true, feedback: 'Correct! Critical in febrile child' },
+              { label: 'Give antibiotics immediately', isCorrect: false, feedback: 'Need diagnosis first' },
+              { label: 'Send home with antipyretics', isCorrect: false, feedback: 'Need full assessment' }
+            ]
+          }
+        ]
+      },
+      {
+        title: 'Headache Diagnosis',
+        difficulty: 'Advanced',
+        category: 'Neurology',
+        steps: [
+          {
+            type: 'info',
+            stepIndex: 0,
+            content: JSON.stringify({
+              patientName: 'Michael Brown',
+              age: 38,
+              gender: 'Male',
+              description: 'Sudden severe headache, worst of life',
+              chiefComplaint: 'صداع شديد مفاجئ'
+            })
+          },
+          {
+            type: 'mcq',
+            stepIndex: 1,
+            question: 'What is the most concerning diagnosis?',
+            maxScore: 20,
+            options: [
+              { label: 'Migraine', isCorrect: false, feedback: 'Unlikely with sudden onset' },
+              { label: 'Subarachnoid hemorrhage', isCorrect: true, feedback: 'Correct! "Thunderclap" headache is classic' },
+              { label: 'Tension headache', isCorrect: false, feedback: 'Not sudden or severe' }
+            ]
+          }
+        ]
+      }
+    ];
+
+    const caseIds = [];
+    for (const caseData of casesData) {
+      // Insert case
+      const caseId = await new Promise((resolve) => {
+        db.run(
+          `INSERT INTO cases (title, difficulty, category, duration, isLocked) VALUES (?, ?, ?, 15, 0)`,
+          [caseData.title, caseData.difficulty, caseData.category],
+          function (err) {
+            if (err) console.error('Case insert error:', err);
+            resolve(this.lastID);
+          }
+        );
+      });
+
+      if (caseId) {
+        caseIds.push(caseId);
+
+        // Insert steps for this case
+        for (const step of caseData.steps) {
+          const stepId = await new Promise((resolve) => {
+            db.run(
+              `INSERT INTO case_steps (caseId, stepIndex, type, content, question, maxScore) VALUES (?, ?, ?, ?, ?, ?)`,
+              [caseId, step.stepIndex, step.type, step.content || null, step.question || null, step.maxScore || 0],
+              function (err) {
+                if (err) console.error('Step insert error:', err);
+                resolve(this.lastID);
+              }
+            );
+          });
+
+          // Insert options if this is an MCQ step
+          if (step.options && stepId) {
+            for (const option of step.options) {
+              await new Promise((resolve) => {
+                db.run(
+                  `INSERT INTO case_step_options (stepId, label, isCorrect, feedback) VALUES (?, ?, ?, ?)`,
+                  [stepId, option.label, option.isCorrect ? 1 : 0, option.feedback],
+                  (err) => {
+                    if (err) console.error('Option insert error:', err);
+                    resolve();
+                  }
+                );
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Create Progress (Completed) for users
+    for (const uid of userIds) {
+      for (const cid of caseIds) {
+        const score = Math.floor(Math.random() * 50) + 50; // 50-100
+        await new Promise((resolve) => {
+          db.run(
+            `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt) VALUES (?, ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE score = VALUES(score)`,
+            [uid, cid, score],
+            () => resolve()
+          );
+        });
+      }
+    }
+
+    res.json({
+      message: 'Seeding complete',
+      users: userIds.length,
+      cases: caseIds.length,
+      details: 'Created 3 users and 4 complete cases with steps and options'
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Seeding failed', error: error.message });
+  }
+});
+
+
 
 app.get('/api/me', authMiddleware(), (req, res) => {
   db.get(
@@ -557,6 +789,30 @@ app.get('/api/admin/cases', authMiddleware('admin'), (req, res) => {
   });
 });
 
+app.get('/api/admin/cases/:id', authMiddleware('admin'), (req, res) => {
+  const { id } = req.params;
+  db.get(`SELECT c.*, cat.name as categoryName FROM cases c LEFT JOIN categories cat ON c.categoryId = cat.id WHERE c.id = ?`, [id], (err, row) => {
+    if (err) return res.status(500).json({ message: 'Database error' });
+    if (!row) return res.status(404).json({ message: 'Case not found' });
+
+    const caseData = {
+      id: row.id,
+      title: row.title,
+      specialty: row.specialty,
+      category: row.category,
+      categoryId: row.categoryId,
+      categoryName: row.categoryName,
+      difficulty: row.difficulty,
+      isLocked: !!row.isLocked,
+      prerequisiteCaseId: row.prerequisiteCaseId,
+      metadata: row.metadata ? JSON.parse(row.metadata) : {},
+      thumbnailUrl: row.thumbnailUrl,
+      duration: row.duration || 10,
+    };
+    res.json(caseData);
+  });
+});
+
 app.post('/api/admin/cases', authMiddleware('admin'), (req, res) => {
   const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration } =
     req.body;
@@ -756,19 +1012,32 @@ app.delete('/api/admin/steps/:id', authMiddleware('admin'), (req, res) => {
 
 // Admin Dashboard Overview
 app.get('/api/admin/overview', authMiddleware('admin'), (req, res) => {
-  db.get(`SELECT COUNT(*) as totalUsers FROM users WHERE role = 'student'`, (err1, users) => {
+  db.get(`SELECT COUNT(*) as totalUsers FROM users WHERE role = 'student'`, [], (err1, users) => {
     if (err1) return res.status(500).json({ message: 'Database error' });
-    db.get(`SELECT COUNT(*) as totalCases FROM cases`, (err2, cases) => {
+    db.get(`SELECT COUNT(*) as totalCases FROM cases`, [], (err2, cases) => {
       if (err2) return res.status(500).json({ message: 'Database error' });
-      db.get(`SELECT COUNT(*) as totalProgress FROM progress WHERE isCompleted = 1`, (err3, progress) => {
+      db.get(`SELECT COUNT(*) as totalProgress FROM progress WHERE isCompleted = 1`, [], (err3, progress) => {
         if (err3) return res.status(500).json({ message: 'Database error' });
-        db.get(`SELECT COUNT(*) as premiumUsers FROM users WHERE membershipType = 'premium'`, (err4, premium) => {
+        db.get(`SELECT COUNT(*) as premiumUsers FROM users WHERE membershipType = 'premium'`, [], (err4, premium) => {
           if (err4) return res.status(500).json({ message: 'Database error' });
-          res.json({
-            totalUsers: users.totalUsers,
-            totalCases: cases.totalCases,
-            totalCompletions: progress.totalProgress,
-            premiumUsers: premium.premiumUsers,
+
+          // Get recent activity
+          db.all(`
+            (SELECT 'user_joined' as type, email as title, createdAt as date FROM users WHERE role = 'student' ORDER BY createdAt DESC LIMIT 5)
+            UNION ALL
+            (SELECT 'case_created' as type, title, createdAt as date FROM cases ORDER BY createdAt DESC LIMIT 5)
+            ORDER BY date DESC
+            LIMIT 10
+          `, [], (err5, activity) => {
+            if (err5) console.error("Activity Error:", err5);
+
+            res.json({
+              totalUsers: users ? users.totalUsers : 0,
+              totalCases: cases ? cases.totalCases : 0,
+              totalCompletions: progress ? progress.totalProgress : 0,
+              premiumUsers: premium ? premium.premiumUsers : 0,
+              recentActivity: activity || []
+            });
           });
         });
       });
@@ -865,6 +1134,43 @@ app.delete('/api/admin/categories/:id', authMiddleware('admin'), (req, res) => {
     });
   });
 });
+
+
+// --- Leaderboard ---
+
+app.get('/api/leaderboard', authMiddleware(), (req, res) => {
+  db.all(`
+    SELECT 
+      u.id as userId, 
+      u.email, 
+      COUNT(p.id) as casesCompleted, 
+      SUM(p.score) as totalScore 
+    FROM users u 
+    JOIN progress p ON u.id = p.userId 
+    WHERE p.isCompleted = 1 
+    GROUP BY u.id, u.email 
+    ORDER BY totalScore DESC 
+    LIMIT 100
+  `, [], (err, rows) => {
+    if (err) {
+      console.error("Leaderboard Error:", err);
+      return res.status(500).json({ message: 'Database error: ' + err.message });
+    }
+
+    // Add rank
+    const leaderboard = rows.map((row, index) => ({
+      rank: index + 1,
+      userId: row.userId,
+      email: row.email,
+      name: row.name || row.email.split('@')[0],
+      casesCompleted: row.casesCompleted,
+      totalScore: Number(row.totalScore || 0)
+    }));
+
+    res.json(leaderboard);
+  });
+});
+
 
 
 /* ======================
