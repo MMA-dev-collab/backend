@@ -68,6 +68,9 @@ async function connectDatabase() {
 
 connectDatabase();
 
+/* ======================
+   SQLITE-COMPAT DB API
+====================== */
 
 
 /* ======================
