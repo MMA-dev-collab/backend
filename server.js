@@ -103,42 +103,95 @@ function authMiddleware(requiredRole) {
 app.post("/api/auth/register", async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
 
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ message: "Email and password required" });
+  const { name, email, phone, password, profileImage } = req.body;
+
+  // Validation
+  if (!name || !email || !phone || !password) {
+    return res.status(400).json({ message: "All fields are required" });
+  }
+
+  // Validate name: English characters only, max 20 chars
+  const nameRegex = /^[A-Za-z\s]{1,20}$/;
+  if (!nameRegex.test(name)) {
+    return res.status(400).json({
+      message: "Name must contain only English letters and be maximum 20 characters"
+    });
+  }
+
+  // Validate email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ message: "Invalid email format" });
+  }
+
+  // Validate phone: digits only
+  const phoneRegex = /^\d{10,15}$/;
+  if (!phoneRegex.test(phone)) {
+    return res.status(400).json({
+      message: "Phone number must contain only digits (10-15 digits)"
+    });
+  }
+
+  // Validate password: min 8 characters
+  if (password.length < 8) {
+    return res.status(400).json({
+      message: "Password must be at least 8 characters"
+    });
   }
 
   const hash = bcrypt.hashSync(password, 10);
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO users (email, passwordHash, role) VALUES (?, ?, 'student')`,
-      [email, hash]
+      `INSERT INTO users (name, email, phone, passwordHash, profileImage, role) VALUES (?, ?, ?, ?, ?, 'student')`,
+      [name, email, phone, hash, profileImage || null]
     );
 
+    const userId = result.insertId;
     const token = jwt.sign(
-      { id: result.insertId, email, role: "student" },
+      { id: userId, email, role: "student" },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
 
-    res.json({ token });
+    // Fetch the created user
+    const [userRows] = await pool.query(
+      `SELECT id, name, email, phone, profileImage, role, membershipType FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    res.json({ token, user: userRows[0] });
   } catch (err) {
     if (err.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "Email already exists" });
+      if (err.message.includes('email')) {
+        return res.status(409).json({ message: "Email already exists" });
+      } else if (err.message.includes('phone')) {
+        return res.status(409).json({ message: "Phone number already exists" });
+      }
+      return res.status(409).json({ message: "Email or phone already exists" });
     }
     console.error(err);
-    return res.status(500).json({ message: "Registration failed" });
+    return res.status(500).json({ message: "Registration failed", error: err.message });
   }
 });
 
 app.post("/api/auth/login", async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
 
-  const { email, password } = req.body;
+  const { identifier, password } = req.body; // identifier can be email or phone
+
+  if (!identifier || !password) {
+    return res.status(400).json({ message: "Email/phone and password required" });
+  }
 
   try {
-    const [rows] = await pool.query(`SELECT * FROM users WHERE email = ?`, [email]);
+    // Check if identifier is email or phone
+    const isEmail = identifier.includes('@');
+    const query = isEmail
+      ? `SELECT * FROM users WHERE email = ?`
+      : `SELECT * FROM users WHERE phone = ?`;
+
+    const [rows] = await pool.query(query, [identifier]);
     const user = rows[0];
 
     if (!user) {
@@ -155,7 +208,9 @@ app.post("/api/auth/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    res.json({ token, user });
+    // Return user info without password hash
+    const { passwordHash, ...userWithoutPassword } = user;
+    res.json({ token, user: userWithoutPassword });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Database error" });
