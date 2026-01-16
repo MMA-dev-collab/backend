@@ -17,7 +17,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
    MIDDLEWARE
 ====================== */
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Increased limit for base64 images
+
 
 /* ======================
    HEALTH CHECK (REQUIRED)
