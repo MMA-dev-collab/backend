@@ -459,19 +459,44 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
   }
 });
 
-app.get('/api/cases', authMiddleware(), async (req, res) => {
+app.get('/api/cases', async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
+    // Optional Auth Logic
+    let userId = null;
+    const header = req.headers.authorization;
+    if (header) {
+      try {
+        const token = header.split(" ")[1];
+        const payload = jwt.verify(token, JWT_SECRET);
+        userId = payload.id;
+      } catch (e) {
+        // Invalid token, proceed as guest
+      }
+    }
+
+    let query;
+    let params = [];
+
+    if (userId) {
+      query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
         COALESCE((
           SELECT MAX(isCompleted) FROM progress p
           WHERE p.userId = ? AND p.caseId = c.id
         ), 0) as isCompleted
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
-       ORDER BY c.id ASC`,
-      [req.user.id]
-    );
+       ORDER BY c.id ASC`;
+      params = [userId];
+    } else {
+      // Guest query: no progress, just cases
+      query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
+        0 as isCompleted
+       FROM cases c
+       LEFT JOIN categories cat ON c.categoryId = cat.id
+       ORDER BY c.id ASC`;
+    }
+
+    const [rows] = await pool.query(query, params);
 
     const cases = rows.map((row) => ({
       id: row.id,
@@ -786,7 +811,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
   const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration } =
     req.body;
-  
+
   try {
     await pool.query(
       `UPDATE cases
@@ -1003,7 +1028,7 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
   try {
     const [rows] = await pool.query(`SELECT id, email, role, membershipType, membershipExpiresAt, createdAt FROM users ORDER BY createdAt DESC`);
-    
+
     const users = await Promise.all(rows.map(async (row) => {
       const [stats] = await pool.query(`SELECT COUNT(DISTINCT caseId) as casesCompleted, SUM(score) as totalScore FROM progress WHERE userId = ? AND isCompleted = 1`, [row.id]);
       return {
