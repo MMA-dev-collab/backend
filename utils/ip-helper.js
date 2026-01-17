@@ -8,14 +8,9 @@ const crypto = require('crypto');
  * @returns {string} - Normalized IP address
  */
 function getClientIP(req) {
-    // If trust proxy is configured, use req.ip (Express handles x-forwarded-for safely)
-    if (req.app.get('trust proxy')) {
-        return normalizeIP(req.ip);
-    }
-
-    // Fallback to direct connection
-    const directIP = req.socket?.remoteAddress || req.connection?.remoteAddress;
-    return normalizeIP(directIP);
+    // Express 'trust proxy' setting populates req.ip correctly
+    // If trust proxy is not set, req.ip defaults to req.socket.remoteAddress
+    return normalizeIP(req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress);
 }
 
 /**

@@ -18,15 +18,17 @@ const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
    TRUSTED PROXY CONFIG (SECURITY)
 ====================== */
 // Configure trusted proxies for secure IP detection
-const TRUSTED_PROXIES = process.env.TRUSTED_PROXIES
-  ? process.env.TRUSTED_PROXIES.split(',').map(ip => ip.trim())
-  : [];
-
-if (TRUSTED_PROXIES.length > 0) {
-  app.set('trust proxy', TRUSTED_PROXIES);
-  console.log('✅ Trust proxy enabled for:', TRUSTED_PROXIES);
+// Railway uses a dynamic edge layer, so we trust the first upstream proxy (hop count = 1)
+if (process.env.RAILWAY_ENVIRONMENT) {
+  app.set('trust proxy', 1);
+  console.log('✅ Railway environment detected: Trusting first proxy hop');
+} else if (process.env.TRUSTED_PROXIES) {
+  // Manual configuration for self-hosted/other environments
+  const trustedProxies = process.env.TRUSTED_PROXIES.split(',').map(ip => ip.trim());
+  app.set('trust proxy', trustedProxies);
+  console.log('✅ Trusted proxies configured:', trustedProxies);
 } else {
-  console.warn('⚠️  No trusted proxies configured. Set TRUSTED_PROXIES in .env for production.');
+  console.warn('⚠️  No trusted proxies configured. Client IPs may be incorrect behind a proxy.');
 }
 
 // In-memory cache for token version validation (performance optimization)
