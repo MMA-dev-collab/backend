@@ -4,6 +4,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
+const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
 
 const app = express();
 
@@ -12,6 +13,25 @@ const app = express();
 ====================== */
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
+
+/* ======================
+   TRUSTED PROXY CONFIG (SECURITY)
+====================== */
+// Configure trusted proxies for secure IP detection
+const TRUSTED_PROXIES = process.env.TRUSTED_PROXIES
+  ? process.env.TRUSTED_PROXIES.split(',').map(ip => ip.trim())
+  : [];
+
+if (TRUSTED_PROXIES.length > 0) {
+  app.set('trust proxy', TRUSTED_PROXIES);
+  console.log('✅ Trust proxy enabled for:', TRUSTED_PROXIES);
+} else {
+  console.warn('⚠️  No trusted proxies configured. Set TRUSTED_PROXIES in .env for production.');
+}
+
+// In-memory cache for token version validation (performance optimization)
+const tokenVersionCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /* ======================
    MIDDLEWARE
@@ -75,10 +95,10 @@ connectDatabase();
 
 
 /* ======================
-   AUTH MIDDLEWARE
+   AUTH MIDDLEWARE (JWT-BASED VALIDATION)
 ====================== */
 function authMiddleware(requiredRole) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const header = req.headers.authorization;
     if (!header) return res.status(401).json({ message: "Missing token" });
 
@@ -86,13 +106,97 @@ function authMiddleware(requiredRole) {
       const token = header.split(" ")[1];
       const payload = jwt.verify(token, JWT_SECRET);
 
+      // Role check
       if (requiredRole && payload.role !== requiredRole) {
         return res.status(403).json({ message: "Forbidden" });
       }
 
+      // NEW: JWT-based device validation (no DB query!)
+      const clientIP = getClientIP(req);
+      const fingerprint = getDeviceFingerprint(req);
+      const deviceType = getDeviceType(req);
+
+      // Check if device locking is enabled in JWT
+      if (payload.device_locked) {
+        // Match against device1
+        const device1Match = matchDevice(
+          {
+            ip: payload.device1_ip,
+            fingerprint: payload.device1_fingerprint,
+            last_seen: new Date() // Not used for JWT validation
+          },
+          clientIP,
+          fingerprint,
+          deviceType
+        );
+
+        // Match against device2
+        const device2Match = matchDevice(
+          {
+            ip: payload.device2_ip,
+            fingerprint: payload.device2_fingerprint,
+            last_seen: new Date()
+          },
+          clientIP,
+          fingerprint,
+          deviceType
+        );
+
+        // Block if neither device matches
+        if (!device1Match && !device2Match) {
+          return res.status(403).json({
+            message: "Access denied: Device not recognized. Please log in again from an authorized device."
+          });
+        }
+      }
+
+      // Periodic token version check (throttled to avoid DB overload)
+      const cacheKey = `token_v_${payload.id}`;
+      const cached = tokenVersionCache.get(cacheKey);
+      const now = Date.now();
+
+      if (!cached || (now - cached.timestamp > CACHE_TTL)) {
+        // Check token version in DB (every 5 minutes)
+        if (pool) {
+          try {
+            const [rows] = await pool.query(
+              `SELECT token_version FROM users WHERE id = ? LIMIT 1`,
+              [payload.id]
+            );
+
+            if (rows.length > 0) {
+              const currentVersion = rows[0].token_version;
+
+              // Cache the result
+              tokenVersionCache.set(cacheKey, { version: currentVersion, timestamp: now });
+
+              // Reject if version mismatch (admin reset)
+              if (payload.token_version !== currentVersion) {
+                return res.status(401).json({
+                  message: "Session invalidated. Please log in again."
+                });
+              }
+            }
+          } catch (dbErr) {
+            console.error('Token version check failed:', dbErr);
+            // Continue without version check (fail-open for availability)
+          }
+        }
+      } else {
+        // Use cached version
+        if (payload.token_version !== cached.version) {
+          return res.status(401).json({
+            message: "Session invalidated. Please log in again."
+          });
+        }
+      }
+
       req.user = payload;
       next();
-    } catch {
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ message: "Token expired" });
+      }
       res.status(401).json({ message: "Invalid token" });
     }
   };
@@ -142,26 +246,78 @@ app.post("/api/auth/register", async (req, res) => {
 
   const hash = bcrypt.hashSync(password, 10);
 
+  // NEW: Capture device info
+  const clientIP = getClientIP(req);
+  const fingerprint = getDeviceFingerprint(req);
+  const now = new Date();
+
+  // Validate IP
+  if (!isValidIP(clientIP)) {
+    console.warn(`Invalid IP detected during registration: ${clientIP}`);
+  }
+
   try {
-    const [result] = await pool.query(
-      `INSERT INTO users (name, email, phone, passwordHash, profileImage, role) VALUES (?, ?, ?, ?, ?, 'student')`,
-      [name, email, phone, hash, profileImage || null]
-    );
+    // BEGIN TRANSACTION
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    const userId = result.insertId;
-    const token = jwt.sign(
-      { id: userId, email, role: "student" },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    try {
+      // Insert user with device1 info
+      const [result] = await connection.query(
+        `INSERT INTO users (
+          name, email, phone, passwordHash, profileImage, role,
+          device1_ip, device1_fingerprint, device1_last_seen,
+          device_locked, token_version
+        ) VALUES (?, ?, ?, ?, ?, 'student', ?, ?, ?, TRUE, 1)`,
+        [name, email, phone, hash, profileImage || null, clientIP, fingerprint, now]
+      );
 
-    // Fetch the created user
-    const [userRows] = await pool.query(
-      `SELECT id, name, email, phone, profileImage, role, membershipType FROM users WHERE id = ?`,
-      [userId]
-    );
+      const userId = result.insertId;
 
-    res.json({ token, user: userRows[0] });
+      // Fetch created user
+      const [userRows] = await connection.query(
+        `SELECT id, name, email, phone, profileImage, role, membershipType,
+                device1_ip, device1_fingerprint, device2_ip, device2_fingerprint,
+                device_locked, token_version
+         FROM users WHERE id = ?`,
+        [userId]
+      );
+
+      const user = userRows[0];
+
+      // COMMIT TRANSACTION
+      await connection.commit();
+      connection.release();
+
+      // Generate JWT with device info
+      const token = jwt.sign(
+        {
+          id: userId,
+          email,
+          role: "student",
+          // Include device info in JWT for middleware validation
+          device1_ip: user.device1_ip,
+          device1_fingerprint: user.device1_fingerprint,
+          device2_ip: user.device2_ip,
+          device2_fingerprint: user.device2_fingerprint,
+          device_locked: user.device_locked,
+          token_version: user.token_version
+        },
+        JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      // Return response (exclude sensitive fields)
+      const { passwordHash, device1_fingerprint, device2_fingerprint, token_version, ...userResponse } = user;
+      res.json({ token, user: userResponse });
+
+    } catch (err) {
+      // ROLLBACK on error
+      await connection.rollback();
+      connection.release();
+      throw err;
+    }
+
   } catch (err) {
     if (err.code === "ER_DUP_ENTRY") {
       if (err.message.includes('email')) {
@@ -171,7 +327,7 @@ app.post("/api/auth/register", async (req, res) => {
       }
       return res.status(409).json({ message: "Email or phone already exists" });
     }
-    console.error(err);
+    console.error('Registration error:', err);
     return res.status(500).json({ message: "Registration failed", error: err.message });
   }
 });
@@ -186,7 +342,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 
   try {
-    // Check if identifier is email or phone
+    // Step 1: Find user and verify password (BEFORE transaction)
     const isEmail = identifier.includes('@');
     const query = isEmail
       ? `SELECT * FROM users WHERE email = ?`
@@ -203,17 +359,162 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
+    // Step 2: Capture current device info
+    const clientIP = getClientIP(req);
+    const fingerprint = getDeviceFingerprint(req);
+    const deviceType = getDeviceType(req);
+    const now = new Date();
 
-    // Return user info without password hash
-    const { passwordHash, ...userWithoutPassword } = user;
-    res.json({ token, user: userWithoutPassword });
+    // Step 3: START TRANSACTION for device lock logic
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Lock user row to prevent race conditions
+      const [lockedRows] = await connection.query(
+        `SELECT id, device1_ip, device1_fingerprint, device1_last_seen,
+                device2_ip, device2_fingerprint, device2_last_seen,
+                device_locked, token_version
+         FROM users
+         WHERE id = ?
+         FOR UPDATE`, // ROW-LEVEL LOCK
+        [user.id]
+      );
+
+      const lockedUser = lockedRows[0];
+
+      // Step 4: Device matching logic
+      let updateQuery = null;
+      let updateParams = [];
+      let deviceMatched = false;
+      let newTokenVersion = lockedUser.token_version;
+
+      // Check if device locking is enabled
+      if (!lockedUser.device_locked) {
+        // Device locking disabled - just update last_seen if device exists
+        if (lockedUser.device1_ip === clientIP) {
+          updateQuery = `UPDATE users SET device1_last_seen = ? WHERE id = ?`;
+          updateParams = [now, user.id];
+        } else if (lockedUser.device2_ip === clientIP) {
+          updateQuery = `UPDATE users SET device2_last_seen = ? WHERE id = ?`;
+          updateParams = [now, user.id];
+        }
+        deviceMatched = true; // Always allow if locking disabled
+      } else {
+        // Device locking enabled - strict validation
+
+        // Check Device 1
+        const device1Match = matchDevice(
+          {
+            ip: lockedUser.device1_ip,
+            fingerprint: lockedUser.device1_fingerprint,
+            last_seen: lockedUser.device1_last_seen
+          },
+          clientIP,
+          fingerprint,
+          deviceType
+        );
+
+        // Check Device 2
+        const device2Match = matchDevice(
+          {
+            ip: lockedUser.device2_ip,
+            fingerprint: lockedUser.device2_fingerprint,
+            last_seen: lockedUser.device2_last_seen
+          },
+          clientIP,
+          fingerprint,
+          deviceType
+        );
+
+        if (device1Match) {
+          // Update device1 last_seen (and IP in case it changed for mobile)
+          updateQuery = `UPDATE users SET device1_ip = ?, device1_last_seen = ? WHERE id = ?`;
+          updateParams = [clientIP, now, user.id];
+          deviceMatched = true;
+        } else if (device2Match) {
+          // Update device2 last_seen
+          updateQuery = `UPDATE users SET device2_ip = ?, device2_last_seen = ? WHERE id = ?`;
+          updateParams = [clientIP, now, user.id];
+          deviceMatched = true;
+        } else if (!lockedUser.device1_ip) {
+          // Device 1 slot is empty - register new device
+          updateQuery = `UPDATE users SET device1_ip = ?, device1_fingerprint = ?, device1_last_seen = ?, token_version = token_version + 1 WHERE id = ?`;
+          updateParams = [clientIP, fingerprint, now, user.id];
+          newTokenVersion = lockedUser.token_version + 1;
+          deviceMatched = true;
+        } else if (!lockedUser.device2_ip) {
+          // Device 2 slot is empty - register new device
+          updateQuery = `UPDATE users SET device2_ip = ?, device2_fingerprint = ?, device2_last_seen = ?, token_version = token_version + 1 WHERE id = ?`;
+          updateParams = [clientIP, fingerprint, now, user.id];
+          newTokenVersion = lockedUser.token_version + 1;
+          deviceMatched = true;
+        } else {
+          // Both slots occupied and no match - BLOCK
+          deviceMatched = false;
+        }
+      }
+
+      // Step 5: Execute update or block
+      if (!deviceMatched) {
+        await connection.rollback();
+        connection.release();
+        return res.status(403).json({
+          message: "Access denied: This account is restricted to registered devices only. Please contact support to reset your devices."
+        });
+      }
+
+      // Execute device update
+      if (updateQuery) {
+        await connection.query(updateQuery, updateParams);
+      }
+
+      // Fetch updated user data
+      const [updatedRows] = await connection.query(
+        `SELECT id, email, role, name, profileImage, membershipType,
+                device1_ip, device1_fingerprint, device2_ip, device2_fingerprint,
+                device_locked, token_version
+         FROM users WHERE id = ?`,
+        [user.id]
+      );
+
+      const updatedUser = updatedRows[0];
+
+      // COMMIT TRANSACTION
+      await connection.commit();
+      connection.release();
+
+      // Step 6: Generate JWT with device info
+      const token = jwt.sign(
+        {
+          id: updatedUser.id,
+          email: updatedUser.email,
+          role: updatedUser.role,
+          // Include device info in JWT for middleware validation
+          device1_ip: updatedUser.device1_ip,
+          device1_fingerprint: updatedUser.device1_fingerprint,
+          device2_ip: updatedUser.device2_ip,
+          device2_fingerprint: updatedUser.device2_fingerprint,
+          device_locked: updatedUser.device_locked,
+          token_version: updatedUser.token_version
+        },
+        JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      // Step 7: Return response
+      const { passwordHash, device1_fingerprint, device2_fingerprint, token_version, ...userWithoutSensitive } = updatedUser;
+      res.json({ token, user: userWithoutSensitive });
+
+    } catch (err) {
+      // ROLLBACK on error
+      await connection.rollback();
+      connection.release();
+      throw err;
+    }
+
   } catch (err) {
-    console.error(err);
+    console.error('Login error:', err);
     res.status(500).json({ message: "Database error" });
   }
 });
@@ -1086,16 +1387,42 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
 // User Management
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
   try {
-    const [rows] = await pool.query(`SELECT id, email, role, membershipType, membershipExpiresAt, createdAt FROM users ORDER BY createdAt DESC`);
+    const [rows] = await pool.query(
+      `SELECT id, email, role, membershipType, membershipExpiresAt,
+              device1_ip, device1_last_seen, device2_ip, device2_last_seen,
+              device_locked, token_version, createdAt
+       FROM users
+       ORDER BY createdAt DESC`
+    );
 
     const users = await Promise.all(rows.map(async (row) => {
-      const [stats] = await pool.query(`SELECT COUNT(DISTINCT caseId) as casesCompleted, SUM(score) as totalScore FROM progress WHERE userId = ? AND isCompleted = 1`, [row.id]);
+      const [stats] = await pool.query(
+        `SELECT COUNT(DISTINCT caseId) as casesCompleted, SUM(score) as totalScore
+         FROM progress WHERE userId = ? AND isCompleted = 1`,
+        [row.id]
+      );
+
       return {
         id: row.id,
         email: row.email,
         role: row.role,
         membershipType: row.membershipType || 'free',
         membershipExpiresAt: row.membershipExpiresAt,
+        deviceInfo: {
+          device1: row.device1_ip ? {
+            ip: row.device1_ip,
+            lastSeen: row.device1_last_seen,
+            active: row.device1_last_seen && (new Date() - new Date(row.device1_last_seen)) < 7 * 24 * 60 * 60 * 1000
+          } : null,
+          device2: row.device2_ip ? {
+            ip: row.device2_ip,
+            lastSeen: row.device2_last_seen,
+            active: row.device2_last_seen && (new Date() - new Date(row.device2_last_seen)) < 7 * 24 * 60 * 60 * 1000
+          } : null,
+          deviceCount: (row.device1_ip ? 1 : 0) + (row.device2_ip ? 1 : 0),
+          locked: !!row.device_locked,
+          tokenVersion: row.token_version
+        },
         createdAt: row.createdAt,
         stats: {
           casesCompleted: stats[0]?.casesCompleted || 0,
@@ -1118,6 +1445,112 @@ app.put('/api/admin/users/:id/membership', authMiddleware('admin'), async (req, 
     res.json({ message: 'Updated' });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// --- Device Management Endpoints ---
+
+// Get detailed device info for specific user
+app.get('/api/admin/users/:id/devices', authMiddleware('admin'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [rows] = await pool.query(
+      `SELECT email, name,
+              device1_ip, device1_fingerprint, device1_last_seen,
+              device2_ip, device2_fingerprint, device2_last_seen,
+              device_locked, token_version, createdAt
+       FROM users WHERE id = ?`,
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = rows[0];
+    res.json({
+      userId: id,
+      email: user.email,
+      name: user.name,
+      devices: {
+        device1: user.device1_ip ? {
+          ip: user.device1_ip,
+          fingerprint: user.device1_fingerprint?.substring(0, 16) + '...', // Truncate for display
+          lastSeen: user.device1_last_seen
+        } : null,
+        device2: user.device2_ip ? {
+          ip: user.device2_ip,
+          fingerprint: user.device2_fingerprint?.substring(0, 16) + '...',
+          lastSeen: user.device2_last_seen
+        } : null,
+        locked: !!user.device_locked,
+        tokenVersion: user.token_version
+      },
+      registeredAt: user.createdAt
+    });
+  } catch (err) {
+    console.error('Error fetching device info:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Reset device locks (with transaction and token invalidation)
+app.post('/api/admin/users/:id/reset-devices', authMiddleware('admin'), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Lock row
+      const [userRows] = await connection.query(
+        `SELECT id, email FROM users WHERE id = ? FOR UPDATE`,
+        [id]
+      );
+
+      if (userRows.length === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      // Reset devices and increment token version
+      await connection.query(
+        `UPDATE users
+         SET device1_ip = NULL,
+             device1_fingerprint = NULL,
+             device1_last_seen = NULL,
+             device2_ip = NULL,
+             device2_fingerprint = NULL,
+             device2_last_seen = NULL,
+             token_version = token_version + 1,
+             device_locked = FALSE
+         WHERE id = ?`,
+        [id]
+      );
+
+      await connection.commit();
+      connection.release();
+
+      // Clear token version cache
+      tokenVersionCache.delete(`token_v_${id}`);
+
+      // Log admin action
+      console.log(`[ADMIN ACTION] User ${req.user.id} reset devices for user ${id} (${userRows[0].email})`);
+
+      res.json({
+        message: 'Device locks reset successfully. User tokens invalidated.',
+        userId: id
+      });
+    } catch (err) {
+      await connection.rollback();
+      connection.release();
+      throw err;
+    }
+  } catch (err) {
+    console.error('Error resetting devices:', err);
     res.status(500).json({ message: 'Database error' });
   }
 });
