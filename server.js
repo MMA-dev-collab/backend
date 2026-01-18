@@ -1653,6 +1653,274 @@ app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
 
 
 
+//    ADMIN SUBSCRIPTION ROUTES
+// ====================== */
+
+// Get all subscription plans
+app.get('/api/admin/subscription-plans', authMiddleware('admin'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`SELECT * FROM subscription_plans ORDER BY price ASC`);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Create subscription plan
+app.post('/api/admin/subscription-plans', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { name, price, durationDays, maxFreeCases, description, features, isActive } = req.body;
+
+    // Basic Validation
+    if (!name || price === undefined || !durationDays) {
+      return res.status(400).json({ message: 'Name, price and duration are required' });
+    }
+
+    // Determine role automatically based on name (legacy support)
+    let role = 'custom';
+    if (name.toLowerCase() === 'normal') role = 'normal';
+    if (name.toLowerCase() === 'premium') role = 'premium';
+
+    await pool.query(
+      `INSERT INTO subscription_plans (name, role, price, durationDays, maxFreeCases, description, features, isActive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, role, price, durationDays, maxFreeCases, description, JSON.stringify(features || []), isActive ? 1 : 0]
+    );
+
+    res.status(201).json({ message: 'Plan created' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Update subscription plan
+app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, price, durationDays, maxFreeCases, description, features, isActive } = req.body;
+
+    const [current] = await pool.query(`SELECT * FROM subscription_plans WHERE id = ?`, [id]);
+    if (!current.length) return res.status(404).json({ message: 'Plan not found' });
+
+    // Don't allow changing name/role of core plans to avoid breaking logic
+    const isCore = current[0].role === 'normal' || current[0].role === 'premium';
+    const newName = isCore ? current[0].name : (name || current[0].name);
+
+    await pool.query(
+      `UPDATE subscription_plans SET name = ?, price = ?, durationDays = ?, maxFreeCases = ?, description = ?, features = ?, isActive = ? WHERE id = ?`,
+      [
+        newName,
+        price !== undefined ? price : current[0].price,
+        durationDays !== undefined ? durationDays : current[0].durationDays,
+        maxFreeCases, // Can be null
+        description !== undefined ? description : current[0].description,
+        features ? JSON.stringify(features) : (typeof current[0].features === 'string' ? current[0].features : JSON.stringify(current[0].features)),
+        isActive !== undefined ? (isActive ? 1 : 0) : current[0].isActive,
+        id
+      ]
+    );
+
+    res.json({ message: 'Plan updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Delete subscription plan
+app.delete('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if plan has subscriptions
+    const [subs] = await pool.query(`SELECT COUNT(*) as count FROM subscriptions WHERE planId = ?`, [id]);
+    if (subs[0].count > 0) {
+      return res.status(400).json({ message: 'Cannot delete plan with existing subscriptions' });
+    }
+
+    // Check if core plan
+    const [plan] = await pool.query(`SELECT role FROM subscription_plans WHERE id = ?`, [id]);
+    if (plan.length && (plan[0].role === 'normal' || plan[0].role === 'premium')) {
+      return res.status(400).json({ message: 'Cannot delete core plans (Normal/Premium)' });
+    }
+
+    await pool.query(`DELETE FROM subscription_plans WHERE id = ?`, [id]);
+    res.json({ message: 'Plan deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Get all subscriptions
+app.get('/api/admin/subscriptions', authMiddleware('admin'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        s.id,
+        s.userId,
+        u.name as userName,
+        u.email,
+        s.planId,
+        sp.name as planName,
+        s.status,
+        s.startDate,
+        s.endDate,
+        DATEDIFF(s.endDate, CURDATE()) as daysRemaining,
+        CASE 
+          WHEN s.endDate < CURDATE() THEN 'expired'
+          WHEN DATEDIFF(s.endDate, CURDATE()) <= 7 THEN 'expiring_soon'
+          ELSE 'active'
+        END AS health
+      FROM subscriptions s
+      JOIN users u ON s.userId = u.id
+      JOIN subscription_plans sp ON s.planId = sp.id
+      ORDER BY s.createdAt DESC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Create subscription
+app.post('/api/admin/subscriptions', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { userId, planId, startDate, endDate } = req.body;
+
+    if (!userId || !planId || !startDate || !endDate) {
+      return res.status(400).json({ message: 'All fields are required' });
+    }
+
+    // Deactivate current active subscription if any
+    await pool.query(`UPDATE subscriptions SET status = 'cancelled' WHERE userId = ? AND status = 'active'`, [userId]);
+
+    const [plan] = await pool.query(`SELECT name FROM subscription_plans WHERE id = ?`, [planId]);
+
+    await pool.query(
+      `INSERT INTO subscriptions (userId, planId, startDate, endDate, status) VALUES (?, ?, ?, ?, 'active')`,
+      [userId, planId, startDate, endDate]
+    );
+
+    await pool.query(
+      `INSERT INTO subscription_history (subscriptionId, userId, action, newPlanId, newEndDate, performedBy, notes) 
+       VALUES (LAST_INSERT_ID(), ?, 'created', ?, ?, ?, 'Created by admin')`,
+      [userId, planId, endDate, req.user.id]
+    );
+
+    res.status(201).json({
+      message: 'Subscription created',
+      planName: plan[0]?.name || 'Unknown'
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Extend subscription
+app.put('/api/admin/subscriptions/:id/extend', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { daysToAdd } = req.body;
+
+    if (!daysToAdd || isNaN(daysToAdd)) {
+      return res.status(400).json({ message: 'Valid days to add is required' });
+    }
+
+    const [sub] = await pool.query(`SELECT * FROM subscriptions WHERE id = ?`, [id]);
+    if (!sub.length) return res.status(404).json({ message: 'Subscription not found' });
+
+    const currentEndDate = new Date(sub[0].endDate);
+    const newEndDate = new Date(currentEndDate);
+    newEndDate.setDate(newEndDate.getDate() + parseInt(daysToAdd));
+
+    await pool.query(`UPDATE subscriptions SET endDate = ? WHERE id = ?`, [newEndDate, id]);
+
+    await pool.query(
+      `INSERT INTO subscription_history (subscriptionId, userId, action, oldEndDate, newEndDate, performedBy, notes) 
+       VALUES (?, ?, 'extended', ?, ?, ?, ?)`,
+      [id, sub[0].userId, sub[0].endDate, newEndDate, req.user.id, `Extended by ${daysToAdd} days`]
+    );
+
+    res.json({ message: 'Subscription extended' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Changed plan
+app.put('/api/admin/subscriptions/:id/change-plan', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newPlanId } = req.body;
+
+    const [sub] = await pool.query(`SELECT * FROM subscriptions WHERE id = ?`, [id]);
+    if (!sub.length) return res.status(404).json({ message: 'Subscription not found' });
+
+    await pool.query(`UPDATE subscriptions SET planId = ? WHERE id = ?`, [newPlanId, id]);
+
+    await pool.query(
+      `INSERT INTO subscription_history (subscriptionId, userId, action, oldPlanId, newPlanId, performedBy, notes) 
+       VALUES (?, ?, 'upgraded', ?, ?, ?, 'Plan changed by admin')`,
+      [id, sub[0].userId, sub[0].planId, newPlanId, req.user.id]
+    );
+
+    res.json({ message: 'Plan changed' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Cancel subscription
+app.put('/api/admin/subscriptions/:id/cancel', authMiddleware('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const [sub] = await pool.query(`SELECT * FROM subscriptions WHERE id = ?`, [id]);
+    if (!sub.length) return res.status(404).json({ message: 'Subscription not found' });
+
+    const [normalPlan] = await pool.query(`SELECT id FROM subscription_plans WHERE name = 'Normal' LIMIT 1`);
+
+    // Change logic: expire current sub, create new normal sub
+    await pool.query(`UPDATE subscriptions SET status = 'cancelled' WHERE id = ?`, [id]);
+
+    if (normalPlan.length) {
+      await pool.query(
+        `INSERT INTO subscriptions (userId, planId, status, startDate, endDate) VALUES (?, ?, 'active', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 365 DAY))`,
+        [sub[0].userId, normalPlan[0].id]
+      );
+    }
+
+    await pool.query(
+      `INSERT INTO subscription_history (subscriptionId, userId, action, performedBy, notes) 
+       VALUES (?, ?, 'cancelled', ?, ?)`,
+      [id, sub[0].userId, req.user.id, reason || 'Cancelled by admin']
+    );
+
+    res.json({ message: 'Subscription cancelled' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+// Add users listing if missing
+app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`SELECT id, name, email, role, phone, createdAt FROM users ORDER BY createdAt DESC`);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
 /* ======================
    SERVER START
 ====================== */
