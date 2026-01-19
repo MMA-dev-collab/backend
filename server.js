@@ -1974,11 +1974,13 @@ app.post('/api/admin/subscription-plans', authMiddleware('admin'), async (req, r
       return res.status(400).json({ message: 'Name and price are required' });
     }
 
-    // Determine role automatically based on name (legacy support)
-    let role = 'custom';
-    if (name.toLowerCase() === 'normal') role = 'normal';
-    if (name.toLowerCase() === 'premium') role = 'premium';
-    if (name.toLowerCase() === 'ultra') role = 'ultra';
+    // Determine role: use provided role, or infer from name (legacy support)
+    let role = req.body.role || 'custom';
+    if (!req.body.role) {
+      if (name.toLowerCase() === 'normal') role = 'normal';
+      if (name.toLowerCase() === 'premium') role = 'premium';
+      if (name.toLowerCase() === 'ultra') role = 'ultra';
+    }
 
     await pool.query(
       `INSERT INTO subscription_plans (name, role, price, durationDays, duration_value, duration_unit, maxFreeCases, description, features, isActive) 
@@ -1988,6 +1990,9 @@ app.post('/api/admin/subscription-plans', authMiddleware('admin'), async (req, r
 
     res.status(201).json({ message: 'Plan created' });
   } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'A plan with this name already exists' });
+    }
     console.error(err);
     res.status(500).json({ message: 'Database error', error: err.message });
   }
@@ -2003,8 +2008,11 @@ app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req
     if (!current.length) return res.status(404).json({ message: 'Plan not found' });
 
     // Don't allow changing name/role of core plans to avoid breaking logic
-    const isCore = current[0].role === 'normal' || current[0].role === 'premium';
+    const isCore = current[0].role === 'normal' || (current[0].role === 'premium' && current[0].name === 'Premium');
+
+    // Allow updating name if not core. Allow updating role if provided and not core.
     const newName = isCore ? current[0].name : (name || current[0].name);
+    const newRole = isCore ? current[0].role : (req.body.role || current[0].role);
 
     // Handle flexible duration update
     let finalDurationValue = current[0].duration_value;
@@ -2025,11 +2033,11 @@ app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req
 
     await pool.query(
       `UPDATE subscription_plans 
-       SET name = ?, price = ?, durationDays = ?, duration_value = ?, duration_unit = ?, 
-           maxFreeCases = ?, description = ?, features = ?, isActive = ? 
+       SET name = ?, role = ?, price = ?, durationDays = ?, duration_value = ?, duration_unit = ?, maxFreeCases = ?, description = ?, features = ?, isActive = ? 
        WHERE id = ?`,
       [
         newName,
+        newRole,
         price !== undefined ? price : current[0].price,
         calculatedDurationDays,
         finalDurationValue,
@@ -2044,6 +2052,9 @@ app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req
 
     res.json({ message: 'Plan updated' });
   } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'A plan with this name already exists' });
+    }
     console.error(err);
     res.status(500).json({ message: 'Database error', error: err.message });
   }
@@ -2209,10 +2220,23 @@ app.put('/api/admin/subscriptions/:id/change-plan', authMiddleware('admin'), asy
     const [sub] = await pool.query(`SELECT * FROM subscriptions WHERE id = ?`, [id]);
     if (!sub.length) return res.status(404).json({ message: 'Subscription not found' });
 
-    // Update the same row - change the plan
+    // Fetch the new plan details to get duration
+    const [newPlan] = await pool.query(`SELECT * FROM subscription_plans WHERE id = ?`, [newPlanId]);
+    if (!newPlan.length) return res.status(404).json({ message: 'New plan not found' });
+
+    // Calculate new end date based on plan duration
+    const today = new Date();
+    const endDate = new Date(today);
+    endDate.setDate(endDate.getDate() + (newPlan[0].durationDays || 0));
+
+    // Format dates for MySQL
+    const startDateStr = today.toISOString().split('T')[0];
+    const endDateStr = endDate.toISOString().split('T')[0];
+
+    // Update the subscription with new plan, start date, and end date
     await pool.query(
-      `UPDATE subscriptions SET planId = ?, status = 'active' WHERE id = ?`,
-      [newPlanId, id]
+      `UPDATE subscriptions SET planId = ?, startDate = ?, endDate = ?, status = 'active' WHERE id = ?`,
+      [newPlanId, startDateStr, endDateStr, id]
     );
 
     await pool.query(
