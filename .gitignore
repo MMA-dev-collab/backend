@@ -4,3 +4,5 @@ dist
 build
 verify_output.txt
 verify_proxy_config.js
+migrations/
+migrations
