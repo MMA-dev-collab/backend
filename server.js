@@ -1456,7 +1456,7 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT id, email, role,
+      `SELECT id, email, role, name,
               device1_ip, device1_last_seen, device2_ip, device2_last_seen,
               device_locked, token_version, createdAt
        FROM users
@@ -1478,6 +1478,7 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
       return {
         id: row.id,
         email: row.email,
+        name: row.name,
         role: row.role,
         membershipType: membership.membershipType,
         membershipExpiresAt: membership.membershipExpiresAt,
