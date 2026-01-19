@@ -4,6 +4,8 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
+const crypto = require("crypto");
+const { sendVerificationEmail } = require('./utils/mailer');
 const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
 const { calculateEndDate, convertToDays, getUserMembership, checkCaseAccess, formatDuration, getPlanHierarchy } = require('./utils/subscription-helper');
 
@@ -210,40 +212,167 @@ function authMiddleware(requiredRole) {
 /* ======================
    AUTH ROUTES
 ====================== */
-app.post("/api/auth/register", async (req, res) => {
+// Rate Limiter for Registration
+const rateLimit = require("express-rate-limit");
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 registration requests per windowMs
+  message: { message: "Too many accounts created from this IP, please try again after 15 minutes" },
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
+
+app.post("/api/auth/register", registerLimiter, async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
 
-  const { name, email, phone, password, profileImage } = req.body;
+  let { name, email, phone, password, profileImage } = req.body;
 
-  // Validation
-  if (!name || !email || !phone || !password) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
+  // 1. Name Validation
+  if (!name) return res.status(400).json({ message: "Name is required" });
+  name = name.trim();
+  // Allow English/Arabic letters, numbers, spaces. Length 3-40.
+  const nameRegex = /^[A-Za-z0-9\u0600-\u06FF\s]{3,40}$/;
+  const hasLetter = /[A-Za-z\u0600-\u06FF]/.test(name);
 
-  // Validate name: English characters only, max 20 chars
-  const nameRegex = /^[A-Za-z\s]{1,20}$/;
-  if (!nameRegex.test(name)) {
+  if (!nameRegex.test(name) || !hasLetter) {
     return res.status(400).json({
-      message: "Name must contain only English letters and be maximum 20 characters"
+      message: "Name must be 3–40 characters and contain at least one letter (Arabic or English)"
     });
   }
 
-  // Validate email format
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  // 2. Email Validation
+  if (!email) return res.status(400).json({ message: "Email is required" });
+  email = email.trim().toLowerCase();
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
   if (!emailRegex.test(email)) {
     return res.status(400).json({ message: "Invalid email format" });
   }
 
-  // Validate phone: digits only
-  const phoneRegex = /^\d{10,15}$/;
-  if (!phoneRegex.test(phone)) {
+  // Deny-list check
+  const domain = email.split('@')[1];
+  const denyList = [
+    // Gmail typos
+    "gamil.com",
+    "gmial.com",
+    "gmai.com",
+    "gmal.com",
+    "gmail.co",
+    "gmail.con",
+    "gmail.cmo",
+    "gmail.cm",
+    "gmail.om",
+    "gmail.comm",
+    "gmail.coom",
+    "gmail.xom",
+    "gail.com",
+
+    // Yahoo typos
+    "yaho.com",
+    "yhoo.com",
+    "yhaoo.com",
+    "yahoo.co",
+    "yahoo.con",
+    "yahoo.cmo",
+    "yahho.com",
+    "yaoo.com",
+    "yaho.co",
+
+    // Outlook / Hotmail typos
+    "outlok.com",
+    "outllok.com",
+    "outloo.com",
+    "outlook.co",
+    "outlook.con",
+    "outlook.cmo",
+    "hotnail.com",
+    "hotmal.com",
+    "hotmial.com",
+    "hotmai.com",
+    "hotmail.co",
+    "hotmail.con",
+    "hotmail.cmo",
+    "hotmali.com",
+
+    // iCloud / Apple
+    "icloud.co",
+    "iclod.com",
+    "icluod.com",
+    "icloud.con",
+    "icloud.cmo",
+
+    // Proton / Zoho / Others
+    "protnmail.com",
+    "protonnmail.com",
+    "protonmai.com",
+    "zoho.co",
+    "zhoo.com",
+
+    // Generic broken domains
+    "mail.co",
+    "email.com",
+    "test.com",
+    "example.com",
+    "domain.com",
+    "yourmail.com",
+    "yourdomain.com",
+    "none.com",
+    "null.com",
+
+    // Common TLD mistakes
+    "gmail.c",
+    "gmail.o",
+    "gmail.m",
+    "yahoo.c",
+    "outlook.c",
+    "hotmail.c",
+    "icloud.c",
+
+    // Obvious bot patterns
+    "tempmail.com",
+    "10minutemail.com",
+    "guerrillamail.com",
+    "mailinator.com",
+    "throwawaymail.com",
+    "fakeinbox.com",
+    "getnada.com",
+    "trashmail.com",
+  ];
+
+  if (denyList.includes(domain)) {
+    // Try to guess the correct one for a helpful message
+    let suggestion = "";
+    if (domain === "gamil.com" || domain === "gil.com") suggestion = "gmail.com";
+    else if (domain === "hotnail.com") suggestion = "hotmail.com";
+    else if (domain === "yaho.com") suggestion = "yahoo.com";
+    else if (domain === "outlok.com") suggestion = "outlook.com";
+    else if (domain === "icloud.co") suggestion = "icloud.com";
+
     return res.status(400).json({
-      message: "Phone number must contain only digits (10-15 digits)"
+      message: `Invalid email domain.${suggestion ? ` Did you mean ${suggestion}?` : ""}`
     });
   }
 
-  // Validate password: min 8 characters
-  if (password.length < 8) {
+  // 3. Phone Validation & Normalization
+  if (!phone) return res.status(400).json({ message: "Phone number is required" });
+  phone = phone.trim();
+
+  // Egyptian Phone Regex: Accepts 010, 011, 012, 015 with optional +20 prefix
+  const phoneRegex = /^(?:\+20|0)(10|11|12|15)\d{8}$/;
+
+  if (!phoneRegex.test(phone)) {
+    return res.status(400).json({
+      message: "Please enter a valid Egyptian phone number (010, 011, 012, 015)"
+    });
+  }
+
+  // Normalize: Convert +2010... to 010...
+  if (phone.startsWith("+20")) {
+    phone = "0" + phone.substring(3);
+  }
+
+  // 4. Password Validation
+  if (!password || password.length < 8) {
     return res.status(400).json({
       message: "Password must be at least 8 characters"
     });
@@ -267,54 +396,38 @@ app.post("/api/auth/register", async (req, res) => {
     await connection.beginTransaction();
 
     try {
-      // Insert user with device1 info
+      // Generate verification code
+      const verificationCode = crypto.randomInt(100000, 999999).toString();
+      const verificationExpires = new Date(now.getTime() + 15 * 60 * 1000); // 15 mins
+
+      // Insert user with device1 info and verification data
       const [result] = await connection.query(
         `INSERT INTO users (
           name, email, phone, passwordHash, profileImage, role,
           device1_ip, device1_fingerprint, device1_last_seen,
-          device_locked, token_version
-        ) VALUES (?, ?, ?, ?, ?, 'student', ?, ?, ?, TRUE, 1)`,
-        [name, email, phone, hash, profileImage || null, clientIP, fingerprint, now]
+          device_locked, token_version,
+          email_verified, email_verification_code, email_verification_expires_at
+        ) VALUES (?, ?, ?, ?, ?, 'student', ?, ?, ?, TRUE, 1, FALSE, ?, ?)`,
+        [name, email, phone, hash, profileImage || null, clientIP, fingerprint, now, verificationCode, verificationExpires]
       );
 
       const userId = result.insertId;
 
-      // Fetch created user
-      const [userRows] = await connection.query(
-        `SELECT id, name, email, phone, profileImage, role, membershipType,
-                device1_ip, device1_fingerprint, device2_ip, device2_fingerprint,
-                device_locked, token_version
-         FROM users WHERE id = ?`,
-        [userId]
-      );
-
-      const user = userRows[0];
+      // Send verification email
+      const emailSent = await sendVerificationEmail(email, verificationCode);
+      if (!emailSent) {
+        console.error("Failed to send verification email to:", email);
+        // We still commit the user, but they will need to resend code
+      }
 
       // COMMIT TRANSACTION
       await connection.commit();
       connection.release();
 
-      // Generate JWT with device info
-      const token = jwt.sign(
-        {
-          id: userId,
-          email,
-          role: "student",
-          // Include device info in JWT for middleware validation
-          device1_ip: user.device1_ip,
-          device1_fingerprint: user.device1_fingerprint,
-          device2_ip: user.device2_ip,
-          device2_fingerprint: user.device2_fingerprint,
-          device_locked: user.device_locked,
-          token_version: user.token_version
-        },
-        JWT_SECRET,
-        { expiresIn: "7d" }
-      );
-
-      // Return response (exclude sensitive fields)
-      const { passwordHash, device1_fingerprint, device2_fingerprint, token_version, ...userResponse } = user;
-      res.json({ token, user: userResponse });
+      res.json({
+        message: "Verification code sent to your email",
+        userId: userId
+      });
 
     } catch (err) {
       // ROLLBACK on error
@@ -334,6 +447,93 @@ app.post("/api/auth/register", async (req, res) => {
     }
     console.error('Registration error:', err);
     return res.status(500).json({ message: "Registration failed", error: err.message });
+  }
+});
+
+app.post("/api/auth/verify-email", async (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+  const { userId, code } = req.body;
+
+  if (!userId || !code) {
+    return res.status(400).json({ message: "User ID and code are required" });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT * FROM users WHERE id = ?`,
+      [userId]
+    );
+    const user = rows[0];
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (user.email_verified) return res.json({ message: "Email already verified" });
+
+    if (user.email_verification_code !== code) {
+      return res.status(400).json({ message: "Invalid verification code" });
+    }
+
+    if (new Date() > new Date(user.email_verification_expires_at)) {
+      return res.status(400).json({ message: "Verification code expired" });
+    }
+
+    // Mark verified and clear code
+    await pool.query(
+      `UPDATE users SET email_verified = TRUE, email_verification_code = NULL, email_verification_expires_at = NULL WHERE id = ?`,
+      [userId]
+    );
+
+    // Generate JWT (same as login)
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        device1_ip: user.device1_ip,
+        device1_fingerprint: user.device1_fingerprint,
+        device2_ip: user.device2_ip,
+        device2_fingerprint: user.device2_fingerprint,
+        device_locked: user.device_locked,
+        token_version: user.token_version
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    const { passwordHash, device1_fingerprint, device2_fingerprint, token_version, email_verification_code, ...userResponse } = user;
+    res.json({ token, user: { ...userResponse, email_verified: 1 } });
+
+  } catch (err) {
+    console.error("Verification error:", err);
+    res.status(500).json({ message: "Verification failed" });
+  }
+});
+
+app.post("/api/auth/resend-code", async (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+  const { userId } = req.body;
+
+  try {
+    const [rows] = await pool.query(`SELECT * FROM users WHERE id = ?`, [userId]);
+    const user = rows[0];
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (user.email_verified) return res.status(400).json({ message: "Email already verified" });
+
+    // Generate new code
+    const newCode = crypto.randomInt(100000, 999999).toString();
+    const newExpires = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      `UPDATE users SET email_verification_code = ?, email_verification_expires_at = ? WHERE id = ?`,
+      [newCode, newExpires, userId]
+    );
+
+    await sendVerificationEmail(user.email, newCode);
+
+    res.json({ message: "New verification code sent" });
+  } catch (err) {
+    console.error("Resend error:", err);
+    res.status(500).json({ message: "Failed to resend code" });
   }
 });
 
@@ -362,6 +562,10 @@ app.post("/api/auth/login", async (req, res) => {
 
     if (!bcrypt.compareSync(password, user.passwordHash)) {
       return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    if (!user.email_verified) {
+      return res.status(403).json({ message: "Email not verified" });
     }
 
     // Step 2: Capture current device info
