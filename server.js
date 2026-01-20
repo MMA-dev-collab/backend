@@ -228,17 +228,15 @@ app.post("/api/auth/register", registerLimiter, async (req, res) => {
   let { name, email, phone, password, profileImage } = req.body;
 
   // 1. Name Validation
-  if (!name) return res.status(400).json({ message: "Name is required" });
-  name = name.trim();
-  // Allow English/Arabic letters, numbers, spaces. Length 3-40.
-  const nameRegex = /^[A-Za-z0-9\u0600-\u06FF\s]{3,40}$/;
-  const hasLetter = /[A-Za-z\u0600-\u06FF]/.test(name);
-
-  if (!nameRegex.test(name) || !hasLetter) {
-    return res.status(400).json({
-      message: "Name must be 3–40 characters and contain at least one letter (Arabic or English)"
-    });
-  }
+if (!name) return res.status(400).json({ message: "Name is required" });
+name = name.trim();
+// Allow only English/Arabic letters and spaces. Length 3-40.
+const nameRegex = /^[A-Za-z\u0600-\u06FF\s]{3,40}$/;
+if (!nameRegex.test(name)) {
+  return res.status(400).json({
+    message: "Name must be 3–40 characters and contain only letters (Arabic or English) and spaces"
+  });
+}
 
   // 2. Email Validation
   if (!email) return res.status(400).json({ message: "Email is required" });
