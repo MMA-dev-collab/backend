@@ -88,9 +88,50 @@ async function connectDatabase() {
     pool = mysql.createPool(DB_CONFIG);
     await pool.query("SELECT 1");
     console.log("✅ Database connected");
+
+    // Run migrations
+    await runMigrations();
   } catch (err) {
     console.error("❌ Database connection failed:", err.message);
     console.log("⚠️ Server will keep running without DB");
+  }
+}
+
+async function runMigrations() {
+  if (!pool) return;
+
+  try {
+    // Migration: Add status column to cases table
+    const [columns] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cases' AND COLUMN_NAME = 'status'`,
+      [DB_CONFIG.database]
+    );
+
+    if (columns.length === 0) {
+      await pool.query(
+        `ALTER TABLE cases 
+         ADD COLUMN status ENUM('draft', 'published') NOT NULL DEFAULT 'draft'`
+      );
+      console.log("✅ Migration: Added status column to cases table");
+    }
+
+    // Migration: Add created_at column if missing
+    const [createdAtColumns] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cases' AND COLUMN_NAME = 'created_at'`,
+      [DB_CONFIG.database]
+    );
+
+    if (createdAtColumns.length === 0) {
+      await pool.query(
+        `ALTER TABLE cases 
+         ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+      );
+      console.log("✅ Migration: Added created_at column to cases table");
+    }
+  } catch (err) {
+    console.error("⚠️ Migration failed:", err.message);
   }
 }
 
@@ -228,15 +269,15 @@ app.post("/api/auth/register", registerLimiter, async (req, res) => {
   let { name, email, phone, password, profileImage } = req.body;
 
   // 1. Name Validation
-if (!name) return res.status(400).json({ message: "Name is required" });
-name = name.trim();
-// Allow only English/Arabic letters and spaces. Length 3-40.
-const nameRegex = /^[A-Za-z\u0600-\u06FF\s]{3,40}$/;
-if (!nameRegex.test(name)) {
-  return res.status(400).json({
-    message: "Name must be 3–40 characters and contain only letters (Arabic or English) and spaces"
-  });
-}
+  if (!name) return res.status(400).json({ message: "Name is required" });
+  name = name.trim();
+  // Allow only English/Arabic letters and spaces. Length 3-25.
+  const nameRegex = /^[A-Za-z\u0600-\u06FF\s]{3,25}$/;
+  if (!nameRegex.test(name)) {
+    return res.status(400).json({
+      message: "Name must be 3–25 characters and contain only letters (Arabic or English) and spaces"
+    });
+  }
 
   // 2. Email Validation
   if (!email) return res.status(400).json({ message: "Email is required" });
@@ -732,6 +773,28 @@ app.post("/api/auth/login", async (req, res) => {
 ====================== */
 
 // SEED OPTION - REMOVE IN PRODUCTION
+app.get('/api/dev/status-check', async (req, res) => {
+  try {
+    if (!pool) return res.status(503).json({ message: "DB unavailable" });
+    const [rows] = await pool.query("SELECT status, COUNT(*) as count FROM cases GROUP BY status");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to check status" });
+  }
+});
+
+app.post('/api/dev/publish-all', async (req, res) => {
+  try {
+    if (!pool) return res.status(503).json({ message: "DB unavailable" });
+    await pool.query("UPDATE cases SET status = 'published'");
+    res.json({ message: "All cases published" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to publish cases" });
+  }
+});
+
 app.post('/api/dev/seed', async (req, res) => {
   try {
     if (!pool) return res.status(503).json({ message: "DB unavailable" });
@@ -1034,6 +1097,11 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
 
 app.get('/api/cases', async (req, res) => {
   try {
+    // Pagination parameters
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 9;
+    const offset = (page - 1) * limit;
+
     // Optional Auth Logic
     let userId = null;
     const header = req.headers.authorization;
@@ -1046,6 +1114,16 @@ app.get('/api/cases', async (req, res) => {
         // Invalid token, proceed as guest
       }
     }
+
+    // Count total cases (debug: no filter)
+    console.log("Checking cases count...");
+    console.log("DB Host:", DB_CONFIG.host);
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) as total FROM cases`
+    );
+    console.log("Count result:", countRows);
+    const total = countRows[0].total;
+    const totalPages = Math.ceil(total / limit);
 
     let query;
     let params = [];
@@ -1060,8 +1138,9 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       ORDER BY c.id ASC`;
-      params = [userId];
+       ORDER BY c.created_at DESC
+       LIMIT ? OFFSET ?`;
+      params = [userId, limit, offset];
     } else {
       // Guest query: no progress, just cases
       query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
@@ -1070,7 +1149,9 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       ORDER BY c.id ASC`;
+       ORDER BY c.created_at DESC
+       LIMIT ? OFFSET ?`;
+      params = [limit, offset];
     }
 
     const [rows] = await pool.query(query, params);
@@ -1083,16 +1164,8 @@ app.get('/api/cases', async (req, res) => {
 
     const cases = rows.map((row) => {
       // Determine if case is locked based on required plan
-      // Determine if case is locked based on required plan
       let isLockedByPlan = false;
       if (row.requiredPlanId) {
-        // Default to 'normal' role if no active plan or user not logged in (assuming public/normal access)
-        // Actually, if !userId, they are a guest. Guests might be 'normal' or 'guest'.
-        // If we want guests to see locked cases, let's treat them as 'normal' (level 1) unless they log in.
-        // Wait, 'normal' is a registered user without a paid plan. Guest is unregistered.
-        // If 'Normal' plan represents free access, then 'Guest' should probably not have access to 'Ultra' cases.
-        // Let's assume Guest = Normal for visibility (showing locked state).
-
         const userRole = (userMembership && userMembership.planRole) ? userMembership.planRole : 'normal';
 
         // Check plan hierarchy
@@ -1121,7 +1194,20 @@ app.get('/api/cases', async (req, res) => {
         isLockedByPlan
       };
     });
-    res.json(cases);
+
+    res.json({
+      data: cases,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages,
+        debug: {
+          host: DB_CONFIG.host,
+          countResult: countRows
+        }
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Database error' });
@@ -1349,6 +1435,7 @@ app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       requiredPlanId: row.requiredPlanId,
       requiredPlanName: row.requiredPlanName,
       requiredPlanRole: row.requiredPlanRole,
+      status: row.status || 'draft',
     }));
     res.json(cases);
   } catch (err) {
@@ -1396,8 +1483,8 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration, requiredPlanId)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration, requiredPlanId, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
       [
         title,
         specialty || null,
@@ -1425,6 +1512,7 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       metadata: metadata || {},
       thumbnailUrl,
       duration: duration || 10,
+      status: 'draft',
     });
   } catch (err) {
     console.error(err);
@@ -1434,11 +1522,26 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
 
 app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration } =
+  const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration, status } =
     req.body;
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
+    // If status is being set to 'published', validate that case has at least 2 steps
+    if (status === 'published') {
+      const [stepRows] = await pool.query(
+        `SELECT COUNT(*) as stepCount FROM case_steps WHERE caseId = ?`,
+        [id]
+      );
+      const stepCount = stepRows[0].stepCount;
+
+      if (stepCount < 2) {
+        return res.status(400).json({
+          message: 'Cannot publish: Case must have at least 2 steps.'
+        });
+      }
+    }
+
     const params = [
       title,
       specialty || null,
@@ -1450,14 +1553,15 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       metadata ? JSON.stringify(metadata) : null,
       thumbnailUrl || null,
       duration || 10,
-      req.body.requiredPlanId === undefined ? null : req.body.requiredPlanId, // Ensure we check explicit value
+      req.body.requiredPlanId === undefined ? null : req.body.requiredPlanId,
+      status || 'draft',
       id,
     ];
     console.log('[DEBUG] SQL Params:', params);
 
     await pool.query(
       `UPDATE cases
-       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?
+       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?, status = ?
        WHERE id = ?`,
       params
     );
