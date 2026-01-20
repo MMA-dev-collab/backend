@@ -1115,13 +1115,12 @@ app.get('/api/cases', async (req, res) => {
       }
     }
 
-    // Count total cases (debug: no filter)
-    console.log("Checking cases count...");
-    console.log("DB Host:", DB_CONFIG.host);
+    // Count total published cases
     const [countRows] = await pool.query(
-      `SELECT COUNT(*) as total FROM cases`
+      `SELECT COUNT(*) as total FROM cases c 
+       WHERE c.status = 'published' 
+       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)`
     );
-    console.log("Count result:", countRows);
     const total = countRows[0].total;
     const totalPages = Math.ceil(total / limit);
 
@@ -1138,6 +1137,8 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
+       WHERE c.status = 'published' 
+       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)
        ORDER BY c.created_at DESC
        LIMIT ? OFFSET ?`;
       params = [userId, limit, offset];
@@ -1149,6 +1150,8 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
+       WHERE c.status = 'published' 
+       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)
        ORDER BY c.created_at DESC
        LIMIT ? OFFSET ?`;
       params = [limit, offset];
