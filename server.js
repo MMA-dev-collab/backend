@@ -2182,7 +2182,23 @@ app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req
       ]
     );
 
-    res.json({ message: 'Plan updated' });
+    // If durationDays changed, update existing active subscriptions for this plan
+    if (calculatedDurationDays !== current[0].durationDays) {
+      console.log(`[Admin] Plan ${id} duration changed from ${current[0].durationDays} to ${calculatedDurationDays}. Updating existing subscriptions...`);
+
+      // Update end dates for all active/pending subscriptions of this plan
+      // Formula: endDate = startDate + newDurationDays
+      await pool.query(
+        `UPDATE subscriptions 
+         SET endDate = DATE_ADD(startDate, INTERVAL (? * 24) HOUR)
+         WHERE planId = ? AND status = 'active'`,
+        [calculatedDurationDays, id]
+      );
+
+      console.log(`[Admin] Successfully updated end dates for subscribers of plan ${id}`);
+    }
+
+    res.json({ message: 'Plan updated and active subscriptions recalculated' });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ message: 'A plan with this name already exists' });
