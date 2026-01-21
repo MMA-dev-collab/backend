@@ -1177,7 +1177,16 @@ app.get('/api/cases', async (req, res) => {
         const userPlanLevel = planHierarchy[userRole] || 1;
         const requiredPlanLevel = planHierarchy[row.requiredPlanRole] || 1;
 
-        isLockedByPlan = userPlanLevel < requiredPlanLevel;
+        // Hierarchical inheritance for Systemic Premium roles
+        if (userRole === 'premium' || userRole === 'ultra') {
+          isLockedByPlan = userPlanLevel < requiredPlanLevel;
+        } else {
+          // Strict match or free access for other roles (Custom/Normal)
+          isLockedByPlan = userRole !== row.requiredPlanRole;
+
+          // Special case: if it requires 'normal', all roles can see it (hierarchy baseline)
+          if (row.requiredPlanRole === 'normal') isLockedByPlan = false;
+        }
       }
 
       return {
@@ -1422,7 +1431,17 @@ app.get('/api/stats/me', authMiddleware(), async (req, res) => {
 
 app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
   try {
-    const [rows] = await pool.query(`SELECT c.*, cat.name as categoryName, sp.name as requiredPlanName, sp.role as requiredPlanRole FROM cases c LEFT JOIN categories cat ON c.categoryId = cat.id LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id ORDER BY c.id DESC`);
+    const [rows] = await pool.query(`
+      SELECT c.*, 
+             cat.name as categoryName, 
+             sp.name as requiredPlanName, 
+             sp.role as requiredPlanRole,
+             (SELECT COUNT(*) FROM case_steps WHERE caseId = c.id) as stepCount
+      FROM cases c 
+      LEFT JOIN categories cat ON c.categoryId = cat.id 
+      LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id 
+      ORDER BY c.id DESC
+    `);
     const cases = rows.map((row) => ({
       id: row.id,
       title: row.title,
@@ -1440,6 +1459,7 @@ app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       requiredPlanName: row.requiredPlanName,
       requiredPlanRole: row.requiredPlanRole,
       status: row.status || 'draft',
+      stepCount: Number(row.stepCount || 0),
     }));
     res.json(cases);
   } catch (err) {
@@ -1531,7 +1551,19 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
-
+    // Step Count Validation for Publication here you can edite the amount of steps on case requerd
+    if (status === 'published') {
+      const [stepRows] = await pool.query(
+        `SELECT COUNT(*) as count FROM case_steps WHERE caseId = ?`,
+        [id]
+      );
+      const sc = stepRows[0].count;
+      if (sc < 3) {
+        return res.status(400).json({
+          message: 'Cannot publish case with less than 3 steps. The case remains drafted.'
+        });
+      }
+    }
     // Validate requiredPlanId if provided
     if (req.body.requiredPlanId) {
       const [planRows] = await pool.query(
@@ -1547,6 +1579,54 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
         return res.status(400).json({
           message: 'Cannot assign case to deactivated plan. Please activate the plan first or choose an active plan.'
         });
+      }
+
+      // Max Free Cases limit check if status is becoming 'published'
+      if (status === 'published' || (!status && req.body.status === 'published')) {
+        const [planInfo] = await pool.query(
+          `SELECT maxFreeCases, name FROM subscription_plans WHERE id = ?`,
+          [req.body.requiredPlanId]
+        );
+
+        if (planInfo[0] && planInfo[0].maxFreeCases !== null) {
+          const limit = planInfo[0].maxFreeCases;
+          const [usageRows] = await pool.query(
+            `SELECT COUNT(*) as currentUsage FROM cases WHERE requiredPlanId = ? AND status = 'published' AND id != ?`,
+            [req.body.requiredPlanId, id]
+          );
+
+          if (usageRows[0].currentUsage >= limit) {
+            return res.status(400).json({
+              message: `Limit reached: The plan "${planInfo[0].name}" only allows a maximum of ${limit} activated cases.`
+            });
+          }
+        }
+      }
+    } else if (status === 'published') {
+      // If status is published but requiredPlanId is NOT provided in body, 
+      // check the existing plan assigned to this case
+      const [caseRows] = await pool.query(`SELECT requiredPlanId FROM cases WHERE id = ?`, [id]);
+      const currentPlanId = caseRows[0]?.requiredPlanId;
+
+      if (currentPlanId) {
+        const [planInfo] = await pool.query(
+          `SELECT maxFreeCases, name FROM subscription_plans WHERE id = ?`,
+          [currentPlanId]
+        );
+
+        if (planInfo[0] && planInfo[0].maxFreeCases !== null) {
+          const limit = planInfo[0].maxFreeCases;
+          const [usageRows] = await pool.query(
+            `SELECT COUNT(*) as currentUsage FROM cases WHERE requiredPlanId = ? AND status = 'published' AND id != ?`,
+            [currentPlanId, id]
+          );
+
+          if (usageRows[0].currentUsage >= limit) {
+            return res.status(400).json({
+              message: `Limit reached: The plan "${planInfo[0].name}" only allows a maximum of ${limit} activated cases.`
+            });
+          }
+        }
       }
     }
 
@@ -1565,7 +1645,6 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       status || 'draft',
       id,
     ];
-    console.log('[DEBUG] SQL Params:', params);
 
     await pool.query(
       `UPDATE cases

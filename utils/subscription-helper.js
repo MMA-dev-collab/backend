@@ -149,8 +149,15 @@ async function checkCaseAccess(pool, userId, caseId) {
         const userPlanLevel = planHierarchy[userPlanRole] || 1; // Default to Normal (1)
         const requiredPlanLevel = planHierarchy[caseData.requiredPlanRole] || 1;
 
-        if (userPlanLevel >= requiredPlanLevel) {
-            return { hasAccess: true, reason: 'Plan access granted', requiredPlan: null };
+        if (userPlanRole === 'premium' || userPlanRole === 'ultra') {
+            if (userPlanLevel >= requiredPlanLevel) {
+                return { hasAccess: true, reason: 'Plan access granted (Hierarchy)', requiredPlan: null };
+            }
+        }
+
+        // 5. Strict Match for Custom/Other rolls (No hierarchy inheritance)
+        if (userPlanRole === caseData.requiredPlanRole) {
+            return { hasAccess: true, reason: 'Plan access granted (Strict Match)', requiredPlan: null };
         }
 
         return {
@@ -175,9 +182,9 @@ async function checkCaseAccess(pool, userId, caseId) {
 function getPlanHierarchy() {
     return {
         'normal': 1,
+        'custom': 1.5, // Protection: Higher than Normal, but lower than Premium
         'premium': 2,
-        'ultra': 3,
-        'custom': 1 // Default custom plans to normal level
+        'ultra': 3
     };
 }
 
