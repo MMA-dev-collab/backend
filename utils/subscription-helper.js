@@ -60,10 +60,10 @@ async function getUserMembership(pool, userId) {
     try {
         const [rows] = await pool.query(
             `SELECT 
-        COALESCE(sp.name, 'Free') AS membershipType,
+        COALESCE(sp.name, 'Normal') AS membershipType,
         s.endDate AS membershipExpiresAt,
         sp.id AS activePlanId,
-        sp.role AS planRole
+        COALESCE(sp.role, 'normal') AS planRole
       FROM users u
       LEFT JOIN subscriptions s ON u.id = s.userId 
         AND s.status = 'active' 
@@ -92,10 +92,10 @@ async function getUserMembership(pool, userId) {
         }
 
         return {
-            membershipType: rows[0].membershipType || 'Free',
+            membershipType: rows[0].membershipType || 'Normal',
             membershipExpiresAt: rows[0].membershipExpiresAt,
             activePlanId: rows[0].activePlanId,
-            planRole: rows[0].planRole
+            planRole: rows[0].planRole || 'normal'
         };
     } catch (err) {
         console.error('Error getting user membership:', err);

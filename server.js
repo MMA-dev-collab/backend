@@ -516,11 +516,34 @@ app.post("/api/auth/verify-email", async (req, res) => {
       return res.status(400).json({ message: "Verification code expired" });
     }
 
-    // Mark verified and clear code
+    // Mark verified, set default membershipType, and clear code
     await pool.query(
-      `UPDATE users SET email_verified = TRUE, email_verification_code = NULL, email_verification_expires_at = NULL WHERE id = ?`,
+      `UPDATE users SET email_verified = TRUE, membershipType = 'Normal', email_verification_code = NULL, email_verification_expires_at = NULL WHERE id = ?`,
       [userId]
     );
+
+    // Auto-assign Normal subscription
+    try {
+      const [normalPlan] = await pool.query(`SELECT id FROM subscription_plans WHERE name = 'Normal' LIMIT 1`);
+      if (normalPlan.length > 0) {
+        const planId = normalPlan[0].id;
+        const startDate = new Date().toISOString().split('T')[0];
+        // 1 year default for Normal
+        const endDate = new Date();
+        endDate.setFullYear(endDate.getFullYear() + 1);
+        const endDateStr = endDate.toISOString().split('T')[0];
+
+        await pool.query(
+          `INSERT INTO subscriptions (userId, planId, startDate, endDate, status) 
+           VALUES (?, ?, ?, ?, 'active') 
+           ON DUPLICATE KEY UPDATE planId = VALUES(planId), status = 'active', endDate = VALUES(endDate)`,
+          [userId, planId, startDate, endDateStr]
+        );
+      }
+    } catch (subErr) {
+      console.error("Failed to auto-assign Normal subscription:", subErr);
+      // Don't fail the verification if subscription fails
+    }
 
     // Generate JWT (same as login)
     const token = jwt.sign(
@@ -2301,24 +2324,26 @@ app.get('/api/admin/subscriptions', authMiddleware('admin'), async (req, res) =>
     const [rows] = await pool.query(`
       SELECT 
         s.id,
-        s.userId,
+        u.id as userId,
         u.name as userName,
         u.email,
         s.planId,
-        sp.name as planName,
-        s.status,
-        s.startDate,
-        s.endDate,
-        DATEDIFF(s.endDate, CURDATE()) as daysRemaining,
+        COALESCE(sp.name, 'Normal') as planName,
+        COALESCE(s.status, 'active') as status,
+        COALESCE(s.startDate, u.createdAt) as startDate,
+        COALESCE(s.endDate, DATE_ADD(u.createdAt, INTERVAL 365 DAY)) as endDate,
+        COALESCE(DATEDIFF(s.endDate, CURDATE()), 365) as daysRemaining,
         CASE 
+          WHEN s.endDate IS NULL THEN 'active'
           WHEN s.endDate < CURDATE() THEN 'expired'
           WHEN DATEDIFF(s.endDate, CURDATE()) <= 7 THEN 'expiring_soon'
           ELSE 'active'
         END AS health
-      FROM subscriptions s
-      JOIN users u ON s.userId = u.id
-      JOIN subscription_plans sp ON s.planId = sp.id
-      ORDER BY s.createdAt DESC
+      FROM users u
+      LEFT JOIN subscriptions s ON u.id = s.userId AND s.status = 'active'
+      LEFT JOIN subscription_plans sp ON s.planId = sp.id
+      WHERE u.role = 'student'
+      ORDER BY s.createdAt DESC, u.createdAt DESC
     `);
     res.json(rows);
   } catch (err) {
