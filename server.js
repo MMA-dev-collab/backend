@@ -1531,20 +1531,6 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
-    // If status is being set to 'published', validate that case has at least 2 steps
-    if (status === 'published') {
-      const [stepRows] = await pool.query(
-        `SELECT COUNT(*) as stepCount FROM case_steps WHERE caseId = ?`,
-        [id]
-      );
-      const stepCount = stepRows[0].stepCount;
-
-      if (stepCount < 2) {
-        return res.status(400).json({
-          message: 'Cannot publish: Case must have at least 2 steps.'
-        });
-      }
-    }
 
     // Validate requiredPlanId if provided
     if (req.body.requiredPlanId) {
@@ -2139,12 +2125,9 @@ app.put('/api/admin/subscription-plans/:id', authMiddleware('admin'), async (req
     const [current] = await pool.query(`SELECT * FROM subscription_plans WHERE id = ?`, [id]);
     if (!current.length) return res.status(404).json({ message: 'Plan not found' });
 
-    // Don't allow changing name/role of core plans to avoid breaking logic
-    const isCore = current[0].role === 'normal' || (current[0].role === 'premium' && current[0].name === 'Premium');
-
-    // Allow updating name if not core. Allow updating role if provided and not core.
-    const newName = isCore ? current[0].name : (name || current[0].name);
-    const newRole = isCore ? current[0].role : (req.body.role || current[0].role);
+    // Allow updating name and role freely (Admin request)
+    const newName = name || current[0].name;
+    const newRole = req.body.role || current[0].role;
 
     // Handle flexible duration update
     let finalDurationValue = current[0].duration_value;
