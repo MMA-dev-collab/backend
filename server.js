@@ -5,7 +5,8 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
-const { sendVerificationEmail } = require('./utils/mailer-resend');
+const { sendVerificationEmail } = ('./utils/mailer-resend');
+// const { sendVerificationEmail } = require('./utils/mailer-resend');
 const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
 const { calculateEndDate, convertToDays, getUserMembership, checkCaseAccess, formatDuration, getPlanHierarchy } = require('./utils/subscription-helper');
 
@@ -1545,6 +1546,24 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       }
     }
 
+    // Validate requiredPlanId if provided
+    if (req.body.requiredPlanId) {
+      const [planRows] = await pool.query(
+        `SELECT isActive FROM subscription_plans WHERE id = ?`,
+        [req.body.requiredPlanId]
+      );
+
+      if (planRows.length === 0) {
+        return res.status(400).json({ message: 'Invalid plan ID' });
+      }
+
+      if (!planRows[0].isActive) {
+        return res.status(400).json({
+          message: 'Cannot assign case to deactivated plan. Please activate the plan first or choose an active plan.'
+        });
+      }
+    }
+
     const params = [
       title,
       specialty || null,
@@ -2044,7 +2063,15 @@ app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
 // Get all subscription plans
 app.get('/api/admin/subscription-plans', authMiddleware('admin'), async (req, res) => {
   try {
-    const [rows] = await pool.query(`SELECT * FROM subscription_plans ORDER BY price ASC`);
+    const { activeOnly } = req.query;
+
+    let query = `SELECT * FROM subscription_plans`;
+    if (activeOnly === 'true') {
+      query += ` WHERE isActive = 1`;
+    }
+    query += ` ORDER BY price ASC`;
+
+    const [rows] = await pool.query(query);
     res.json(rows);
   } catch (err) {
     console.error(err);

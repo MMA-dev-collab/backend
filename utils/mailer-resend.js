@@ -1,9 +1,17 @@
 const { Resend } = require('resend');
 
 // Initialize Resend client
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-console.log('📧 Mailer Config: Provider: Resend API (HTTPS)');
+let resend;
+if (process.env.RESEND_API_KEY) {
+  try {
+    resend = new Resend(process.env.RESEND_API_KEY);
+    console.log('📧 Mailer Config: Provider: Resend API (HTTPS)');
+  } catch (e) {
+    console.warn('⚠️ Mailer Warning: Failed to initialize Resend:', e.message);
+  }
+} else {
+  console.warn('⚠️ Mailer Warning: RESEND_API_KEY is missing. Email sending will be disabled.');
+}
 
 /**
  * Sends a verification email to the user using Resend API.
@@ -11,12 +19,17 @@ console.log('📧 Mailer Config: Provider: Resend API (HTTPS)');
  * @param {string} code - The 6-digit verification code.
  */
 async function sendVerificationEmail(email, code) {
-    try {
-        const { data, error } = await resend.emails.send({
-            from: process.env.EMAIL_FROM || 'PhysioSim <onboarding@resend.dev>',
-            to: [email],
-            subject: "Verify your PhysioSim account",
-            html: `
+  if (!resend) {
+    console.log(`[DEV MODE] Email suppression: Verification code for ${email} is ${code}`);
+    return true; // Simulate success in dev/no-key mode
+  }
+
+  try {
+    const { data, error } = await resend.emails.send({
+      from: process.env.EMAIL_FROM || 'PhysioSim <onboarding@resend.dev>',
+      to: [email],
+      subject: "Verify your PhysioSim account",
+      html: `
         <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
           <h2 style="color: #2c3e50;">Verify your email</h2>
           <p>Thank you for registering with PhysioSim. Please use the following code to verify your account:</p>
@@ -27,19 +40,19 @@ async function sendVerificationEmail(email, code) {
           <p style="font-size: 12px; color: #7f8c8d; margin-top: 30px;">If you didn't request this, please ignore this email.</p>
         </div>
       `,
-        });
+    });
 
-        if (error) {
-            console.error("Resend API error:", error);
-            return false;
-        }
-
-        console.log("Message sent via Resend: %s", data.id);
-        return true;
-    } catch (error) {
-        console.error("Error sending email via Resend:", error);
-        return false;
+    if (error) {
+      console.error("Resend API error:", error);
+      return false;
     }
+
+    console.log("Message sent via Resend: %s", data.id);
+    return true;
+  } catch (error) {
+    console.error("Error sending email via Resend:", error);
+    return false;
+  }
 }
 
 module.exports = { sendVerificationEmail };
