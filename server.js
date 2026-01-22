@@ -1126,6 +1126,12 @@ app.get('/api/cases', async (req, res) => {
     const limit = parseInt(req.query.limit) || 9;
     const offset = (page - 1) * limit;
 
+    // Filter parameters
+    const search = req.query.search || '';
+    const category = req.query.category || 'all';
+    const difficulty = req.query.difficulty || 'all';
+    const duration = req.query.duration || 'all';
+
     // Optional Auth Logic
     let userId = null;
     const header = req.headers.authorization;
@@ -1139,11 +1145,45 @@ app.get('/api/cases', async (req, res) => {
       }
     }
 
-    // Count total published cases
+    // Build filter conditions
+    let filterClauses = ["c.status = 'published'", "EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)"];
+    let filterParams = [];
+
+    if (search) {
+      filterClauses.push("(c.title LIKE ? OR c.metadata LIKE ?)");
+      filterParams.push(`%${search}%`, `%${search}%`);
+    }
+    if (category !== 'all') {
+      // Try to match by ID or by the category name/string
+      filterClauses.push("(c.categoryId = ? OR c.category = ? OR cat.name = ?)");
+      filterParams.push(category, category, category);
+    }
+    if (difficulty !== 'all') {
+      filterClauses.push("c.difficulty = ?");
+      filterParams.push(difficulty);
+    }
+    if (duration !== 'all') {
+      if (duration === 'short') {
+        filterClauses.push("(c.duration <= 10 OR c.duration IS NULL)");
+      } else if (duration === 'medium') {
+        filterClauses.push("(c.duration > 10 AND c.duration <= 20)");
+      } else if (duration === 'long') {
+        filterClauses.push("c.duration > 20");
+      }
+    }
+
+    const whereClause = filterClauses.length > 0 ? "WHERE " + filterClauses.join(" AND ") : "";
+
+    console.log('[DEBUG] /api/cases filters:', { search, category, difficulty, duration });
+    console.log('[DEBUG] /api/cases where:', whereClause);
+    console.log('[DEBUG] /api/cases params:', filterParams);
+
+    // Count total filtered cases
     const [countRows] = await pool.query(
       `SELECT COUNT(*) as total FROM cases c 
-       WHERE c.status = 'published' 
-       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)`
+       LEFT JOIN categories cat ON c.categoryId = cat.id
+       ${whereClause}`,
+      filterParams
     );
     const total = countRows[0].total;
     const totalPages = Math.ceil(total / limit);
@@ -1161,11 +1201,10 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       WHERE c.status = 'published' 
-       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)
+       ${whereClause}
        ORDER BY c.created_at DESC
        LIMIT ? OFFSET ?`;
-      params = [userId, limit, offset];
+      params = [userId, ...filterParams, limit, offset];
     } else {
       // Guest query: no progress, just cases
       query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
@@ -1174,11 +1213,10 @@ app.get('/api/cases', async (req, res) => {
        FROM cases c
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       WHERE c.status = 'published' 
-       AND EXISTS (SELECT 1 FROM case_steps cs WHERE cs.caseId = c.id)
+       ${whereClause}
        ORDER BY c.created_at DESC
        LIMIT ? OFFSET ?`;
-      params = [limit, offset];
+      params = [...filterParams, limit, offset];
     }
 
     const [rows] = await pool.query(query, params);
