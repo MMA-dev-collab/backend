@@ -5,8 +5,7 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
-const { sendVerificationEmail } = ('./utils/mailer-resend');
-// const { sendVerificationEmail } = require('./utils/mailer-resend');
+const { sendVerificationEmail } = require('./utils/mailer-resend');
 const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
 const { calculateEndDate, convertToDays, getUserMembership, checkCaseAccess, formatDuration, getPlanHierarchy } = require('./utils/subscription-helper');
 
