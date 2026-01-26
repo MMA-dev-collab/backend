@@ -1376,6 +1376,10 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
             imageUrl: x.imageUrl,
           };
         }),
+      tag: s.tag,
+      expected_time: s.expected_time,
+      hint_text: s.hint_text,
+      hint_enabled: !!s.hint_enabled
     }));
 
     res.json({
@@ -1402,7 +1406,7 @@ app.post(
   '/api/cases/:caseId/steps/:stepId/answer',
   authMiddleware(),
   async (req, res) => {
-    const { selectedOptionId, isFinalStep } = req.body;
+    const { selectedOptionId, isFinalStep, timeSpent, hintShown, attemptNumber } = req.body;
     const { caseId, stepId } = req.params;
 
     try {
@@ -1416,6 +1420,28 @@ app.post(
         return res.status(400).json({ message: 'Invalid option' });
 
       const isCorrect = !!optionRow.isCorrect;
+
+      // Record the attempt in step_attempts table for performance tracking
+      try {
+        await pool.query(
+          `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            req.user.id,
+            caseId,
+            stepId,
+            selectedOptionId,
+            isCorrect ? 1 : 0,
+            timeSpent || 0,
+            hintShown ? 1 : 0,
+            attemptNumber || 1
+          ]
+        );
+      } catch (attemptErr) {
+        // Log but don't fail the main request if attempt tracking fails
+        console.error('Failed to record step attempt:', attemptErr);
+      }
+
       if (!isCorrect) {
         return res.json({
           correct: false,
@@ -1520,6 +1546,10 @@ app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       requiredPlanRole: row.requiredPlanRole,
       status: row.status || 'draft',
       stepCount: Number(row.stepCount || 0),
+      tag: row.tag,
+      expected_time: row.expected_time,
+      hint_text: row.hint_text,
+      hint_enabled: !!row.hint_enabled
     }));
     res.json(cases);
   } catch (err) {
@@ -1752,7 +1782,11 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
       content: s.content ? JSON.parse(s.content) : {},
       options: options.filter(o => o.stepId === s.id).map(o => ({ ...o, isCorrect: !!o.isCorrect })),
       investigations: invs.filter(i => i.stepId === s.id),
-      xrays: xrays.filter(x => x.stepId === s.id)
+      xrays: xrays.filter(x => x.stepId === s.id),
+      tag: s.tag,
+      expected_time: s.expected_time,
+      hint_text: s.hint_text,
+      hint_enabled: !!s.hint_enabled
     }));
     res.json(detailedSteps);
   } catch (err) {
@@ -1764,12 +1798,12 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
 // POST new step
 app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays } = req.body;
+  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, hint_text, tag, expected_time, hint_enabled } = req.body;
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO case_steps (caseId, stepIndex, type, content, question, explanationOnFail, maxScore) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [id, stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore]
+      `INSERT INTO case_steps (caseId, stepIndex, type, content, question, explanationOnFail, maxScore, hint_text, tag, expected_time, hint_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1]
     );
     const stepId = result.insertId;
 
@@ -1813,12 +1847,12 @@ app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res)
 // PUT update step
 app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays } = req.body;
+  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, hint_text, tag, expected_time, hint_enabled } = req.body;
 
   try {
     await pool.query(
-      `UPDATE case_steps SET stepIndex=?, type=?, content=?, question=?, explanationOnFail=?, maxScore=? WHERE id=?`,
-      [stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore, id]
+      `UPDATE case_steps SET stepIndex=?, type=?, content=?, question=?, explanationOnFail=?, maxScore=?, hint_text=?, tag=?, expected_time=?, hint_enabled=? WHERE id=?`,
+      [stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, id]
     );
 
     // Clean up related data to overwrite
@@ -2621,6 +2655,153 @@ app.get('/api/admin/cases/access', authMiddleware('admin'), async (req, res) => 
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Database error', error: err.message });
+  }
+});
+
+/* ======================
+   PERFORMANCE ANALYTICS ENDPOINTS
+====================== */
+
+// Default expected times by step type (in seconds)
+const STEP_TYPE_EXPECTED_TIMES = {
+  'mcq': 45,
+  'history': 90,
+  'diagnosis': 120,
+  'treatment': 90,
+  'info': 30,
+  'investigation': 60
+};
+
+// Get performance analysis for current user
+app.get('/api/performance/analysis', authMiddleware(), async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get overall stats
+    const [overallRows] = await pool.query(
+      `SELECT 
+         COUNT(*) as totalAttempts,
+         SUM(isCorrect) as correctAttempts,
+         AVG(timeSpent) as avgTimePerQuestion
+       FROM step_attempts
+       WHERE userId = ?`,
+      [userId]
+    );
+    const overall = overallRows[0];
+    const accuracyRate = overall.totalAttempts > 0
+      ? Math.round((overall.correctAttempts / overall.totalAttempts) * 100)
+      : 0;
+
+    // Get stats grouped by tag
+    const [tagRows] = await pool.query(
+      `SELECT 
+         cs.tag,
+         cs.type as stepType,
+         cs.expected_time,
+         COUNT(*) as totalAttempts,
+         SUM(sa.isCorrect) as correctAttempts,
+         AVG(sa.timeSpent) as avgTimeSpent
+       FROM step_attempts sa
+       JOIN case_steps cs ON sa.stepId = cs.id
+       WHERE sa.userId = ? AND cs.tag IS NOT NULL
+       GROUP BY cs.tag, cs.type, cs.expected_time`,
+      [userId]
+    );
+
+    const byTag = tagRows.map(row => {
+      const errorRate = row.totalAttempts > 0
+        ? Math.round(((row.totalAttempts - row.correctAttempts) / row.totalAttempts) * 100 * 10) / 10
+        : 0;
+
+      // Use custom expected_time or fall back to step type default
+      const expectedTime = row.expected_time || STEP_TYPE_EXPECTED_TIMES[row.stepType] || 60;
+      const avgTimeSpent = Math.round(row.avgTimeSpent || 0);
+
+      // Determine confidence tier
+      let confidence, label;
+      if (errorRate < 25 && avgTimeSpent <= expectedTime) {
+        confidence = 'strong';
+        label = `Strong in ${row.tag}`;
+      } else if (errorRate >= 25 && errorRate <= 50) {
+        confidence = 'neutral';
+        label = 'Needs improvement';
+      } else {
+        confidence = 'weak';
+        label = 'Critical weakness';
+      }
+
+      return {
+        tag: row.tag,
+        totalAttempts: row.totalAttempts,
+        correctAttempts: row.correctAttempts || 0,
+        errorRate,
+        avgTimeSpent,
+        expectedTime,
+        confidence,
+        label
+      };
+    });
+
+    // Get accuracy over time (last 30 days)
+    const [timeRows] = await pool.query(
+      `SELECT 
+         DATE(createdAt) as date,
+         COUNT(*) as total,
+         SUM(isCorrect) as correct
+       FROM step_attempts
+       WHERE userId = ? AND createdAt >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+       GROUP BY DATE(createdAt)
+       ORDER BY date ASC`,
+      [userId]
+    );
+
+    const accuracyOverTime = timeRows.map(row => ({
+      date: row.date,
+      accuracy: row.total > 0 ? Math.round((row.correct / row.total) * 100) : 0
+    }));
+
+    res.json({
+      overallStats: {
+        totalAttempts: overall.totalAttempts || 0,
+        correctAttempts: overall.correctAttempts || 0,
+        accuracyRate,
+        avgTimePerQuestion: Math.round(overall.avgTimePerQuestion || 0)
+      },
+      byTag,
+      accuracyOverTime
+    });
+
+  } catch (err) {
+    console.error('Performance analysis error:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Get hint for a specific step
+app.get('/api/steps/:stepId/hint', authMiddleware(), async (req, res) => {
+  try {
+    const { stepId } = req.params;
+
+    const [rows] = await pool.query(
+      `SELECT hint_text FROM case_steps WHERE id = ?`,
+      [stepId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ message: 'Step not found' });
+    }
+
+    const hintText = rows[0].hint_text;
+
+    if (!hintText) {
+      return res.json({ hint: null, message: 'No hint available for this step' });
+    }
+
+    res.json({ hint: hintText });
+
+  } catch (err) {
+    console.error('Hint retrieval error:', err);
+    res.status(500).json({ message: 'Database error' });
   }
 });
 
