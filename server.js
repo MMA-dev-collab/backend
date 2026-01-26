@@ -1173,9 +1173,7 @@ app.get('/api/cases', async (req, res) => {
 
     const whereClause = filterClauses.length > 0 ? "WHERE " + filterClauses.join(" AND ") : "";
 
-    console.log('[DEBUG] /api/cases filters:', { search, category, difficulty, duration });
-    console.log('[DEBUG] /api/cases where:', whereClause);
-    console.log('[DEBUG] /api/cases params:', filterParams);
+
 
     // Count total filtered cases
     const [countRows] = await pool.query(
@@ -1382,6 +1380,34 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       hint_enabled: !!s.hint_enabled
     }));
 
+    // Load attempts if user is logged in
+    const [attempts] = await pool.query(
+      `SELECT stepId, selectedOptionId, isCorrect, attemptNumber 
+       FROM step_attempts 
+       WHERE caseId = ? AND userId = ?
+       ORDER BY attemptNumber DESC`, // Get latest attempts
+      [caseId, req.user.id]
+    );
+
+    // Create a map of latest attempts per step
+    const latestAttempts = {};
+    attempts.forEach(a => {
+      // Since we ordered by DESC, the first one we see is the latest
+      if (!latestAttempts[a.stepId]) {
+        latestAttempts[a.stepId] = {
+          selectedOptionId: a.selectedOptionId,
+          isCorrect: !!a.isCorrect
+        };
+      }
+    });
+
+    // Check completion status
+    const [progressRows] = await pool.query(
+      `SELECT isCompleted, score FROM progress WHERE userId = ? AND caseId = ?`,
+      [req.user.id, caseId]
+    );
+    const progress = progressRows[0];
+
     res.json({
       id: caseRow.id,
       title: caseRow.title,
@@ -1393,6 +1419,9 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
         : {},
       thumbnailUrl: caseRow.thumbnailUrl,
       duration: caseRow.duration || 10,
+      isCompleted: !!progress?.isCompleted,
+      userScore: progress?.score,
+      userProgress: latestAttempts,
       steps: stepsDto,
     });
 
@@ -1450,16 +1479,27 @@ app.post(
       }
 
       if (isFinalStep) {
+        // Calculate total score dynamically (Scoring Fix)
+        // Only count correct attempts on MCQ steps
         const [scoreRows] = await pool.query(
-          `SELECT SUM(maxScore) as totalScore
-           FROM case_steps WHERE caseId = ?`,
-          [caseId]
+          `SELECT SUM(cs.maxScore) as totalScore
+           FROM step_attempts sa
+           JOIN case_steps cs ON sa.stepId = cs.id
+           WHERE sa.caseId = ? AND sa.userId = ? AND cs.type = 'mcq' AND sa.isCorrect = 1
+           AND sa.id IN (
+               SELECT MAX(id) FROM step_attempts 
+               WHERE caseId = ? AND userId = ? 
+               GROUP BY stepId
+           )`,
+          [caseId, req.user.id, caseId, req.user.id]
         );
         const score = scoreRows[0].totalScore || 0;
 
+        // Completion Persistence Fix: Upsert progress
         await pool.query(
-          `INSERT INTO progress (userId, caseId, score, isCompleted)
-           VALUES (?, ?, ?, 1)`,
+          `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt)
+           VALUES (?, ?, ?, 1, NOW())
+           ON DUPLICATE KEY UPDATE score = VALUES(score), isCompleted = 1, createdAt = VALUES(createdAt)`,
           [req.user.id, caseId, score]
         );
 
@@ -1641,16 +1681,24 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
-    // Step Count Validation for Publication here you can edite the amount of steps on case requerd
+    // Step Count Validation for Publication
     if (status === 'published') {
       const [stepRows] = await pool.query(
-        `SELECT COUNT(*) as count FROM case_steps WHERE caseId = ?`,
+        `SELECT * FROM case_steps WHERE caseId = ? ORDER BY stepIndex ASC`,
         [id]
       );
-      const sc = stepRows[0].count;
+      const sc = stepRows.length;
       if (sc < 3) {
         return res.status(400).json({
           message: 'Cannot publish case with less than 3 steps. The case remains drafted.'
+        });
+      }
+
+      // MCQ Rule: Case must end with MCQ
+      const lastStep = stepRows[stepRows.length - 1];
+      if (lastStep.type !== 'mcq') {
+        return res.status(400).json({
+          message: 'A case must end with an MCQ step to assess the student.'
         });
       }
     }
@@ -2696,15 +2744,15 @@ app.get('/api/performance/analysis', authMiddleware(), async (req, res) => {
     const [tagRows] = await pool.query(
       `SELECT 
          cs.tag,
-         cs.type as stepType,
-         cs.expected_time,
+         -- cs.type as stepType, -- Removed from group by
+         AVG(cs.expected_time) as expected_time,
          COUNT(*) as totalAttempts,
          SUM(sa.isCorrect) as correctAttempts,
          AVG(sa.timeSpent) as avgTimeSpent
        FROM step_attempts sa
        JOIN case_steps cs ON sa.stepId = cs.id
        WHERE sa.userId = ? AND cs.tag IS NOT NULL
-       GROUP BY cs.tag, cs.type, cs.expected_time`,
+       GROUP BY cs.tag`,
       [userId]
     );
 
@@ -2713,8 +2761,10 @@ app.get('/api/performance/analysis', authMiddleware(), async (req, res) => {
         ? Math.round(((row.totalAttempts - row.correctAttempts) / row.totalAttempts) * 100 * 10) / 10
         : 0;
 
-      // Use custom expected_time or fall back to step type default
-      const expectedTime = row.expected_time || STEP_TYPE_EXPECTED_TIMES[row.stepType] || 60;
+      // Use aggregated expected_time (avg) or default to 60 if null
+      // Since we group by tag, steps might have different types, but usually tags align with types or topics.
+      // Simplification: use 60s as baseline or average.
+      const expectedTime = Math.round(row.expected_time || 60);
       const avgTimeSpent = Math.round(row.avgTimeSpent || 0);
 
       // Determine confidence tier
