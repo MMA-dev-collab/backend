@@ -1109,6 +1109,7 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
       rank: rank || '-',
       membershipType: membership.membershipType,
       membershipExpiresAt: membership.membershipExpiresAt,
+      planRole: membership.planRole,
       completedCases: completedCases || []
     });
 
