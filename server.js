@@ -130,6 +130,76 @@ async function runMigrations() {
       );
       console.log("✅ Migration: Added created_at column to cases table");
     }
+
+    // Migration: Create essay_questions table
+    const [essayTableExists] = await pool.query(
+      `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'essay_questions'`,
+      [DB_CONFIG.database]
+    );
+
+    if (essayTableExists.length === 0) {
+      await pool.query(
+        `CREATE TABLE essay_questions (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          step_id INT NOT NULL,
+          question_text TEXT NOT NULL,
+          keywords JSON NOT NULL,
+          synonyms JSON,
+          max_score INT DEFAULT 10,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          FOREIGN KEY (step_id) REFERENCES case_steps(id) ON DELETE CASCADE,
+          INDEX idx_step_id (step_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+      );
+      console.log("✅ Migration: Created essay_questions table");
+    }
+
+    // Migration: Add essay_answer column to step_attempts
+    const [essayAnswerColumn] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'step_attempts' AND COLUMN_NAME = 'essay_answer'`,
+      [DB_CONFIG.database]
+    );
+
+    if (essayAnswerColumn.length === 0) {
+      await pool.query(
+        `ALTER TABLE step_attempts 
+         ADD COLUMN essay_answer TEXT`
+      );
+      console.log("✅ Migration: Added essay_answer column to step_attempts table");
+    }
+
+    // Migration: Add matched_keywords column to step_attempts
+    const [matchedKeywordsColumn] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'step_attempts' AND COLUMN_NAME = 'matched_keywords'`,
+      [DB_CONFIG.database]
+    );
+
+    if (matchedKeywordsColumn.length === 0) {
+      await pool.query(
+        `ALTER TABLE step_attempts 
+         ADD COLUMN matched_keywords JSON`
+      );
+      console.log("✅ Migration: Added matched_keywords column to step_attempts table");
+    }
+
+    // Migration: Add perfect_answer column to essay_questions
+    const [perfectAnswerColumn] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'essay_questions' AND COLUMN_NAME = 'perfect_answer'`,
+      [DB_CONFIG.database]
+    );
+
+    if (perfectAnswerColumn.length === 0) {
+      await pool.query(
+        `ALTER TABLE essay_questions 
+         ADD COLUMN perfect_answer TEXT`
+      );
+      console.log("✅ Migration: Added perfect_answer column to essay_questions table");
+    }
   } catch (err) {
     console.error("⚠️ Migration failed:", err.message);
   }
@@ -1340,12 +1410,20 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
     const [options] = await pool.query(`SELECT * FROM case_step_options WHERE stepId IN (${placeholders})`, stepIds);
     const [inv] = await pool.query(`SELECT * FROM investigations WHERE stepId IN (${placeholders})`, stepIds);
     const [xrays] = await pool.query(`SELECT * FROM xrays WHERE stepId IN (${placeholders})`, stepIds);
+    const [essayQuestions] = await pool.query(`SELECT * FROM essay_questions WHERE step_id IN (${placeholders})`, stepIds);
 
     const stepsDto = steps.map((s) => ({
       id: s.id,
       stepIndex: s.stepIndex,
       type: s.type,
-      content: s.content ? JSON.parse(s.content) : null,
+      content: (() => {
+        try {
+          return s.content ? JSON.parse(s.content) : null;
+        } catch (e) {
+          console.warn(`Failed to parse content for step ${s.id}:`, e.message);
+          return null;
+        }
+      })(),
       question: s.question,
       explanationOnFail: s.explanationOnFail,
       maxScore: s.maxScore,
@@ -1375,6 +1453,26 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
             imageUrl: x.imageUrl,
           };
         }),
+      essayQuestions: essayQuestions.filter((eq) => eq.step_id === s.id).map((eq) => {
+        const safeParseList = (data) => {
+          if (!data) return [];
+          try {
+            const parsed = JSON.parse(data);
+            if (Array.isArray(parsed)) return parsed;
+            return [];
+          } catch (e) {
+            return String(data).split(',').map(s => s.trim()).filter(Boolean);
+          }
+        };
+        return {
+          id: eq.id,
+          question_text: eq.question_text,
+          keywords: safeParseList(eq.keywords),
+          synonyms: safeParseList(eq.synonyms),
+          max_score: eq.max_score,
+          perfect_answer: eq.perfect_answer || ''
+        };
+      }),
       tag: s.tag,
       expected_time: s.expected_time,
       hint_text: s.hint_text,
@@ -1534,6 +1632,235 @@ app.post(
     }
   }
 );
+
+// Essay Answer Submission Endpoint
+app.post(
+  '/api/cases/:caseId/steps/:stepId/answer-essay',
+  authMiddleware(),
+  async (req, res) => {
+    const { essayAnswer, isFinalStep, timeSpent, hintShown, attemptNumber } = req.body;
+    const { caseId, stepId } = req.params;
+
+    try {
+      // Fetch essay questions for this step
+      const [essayQuestions] = await pool.query(
+        `SELECT * FROM essay_questions WHERE step_id = ?`,
+        [stepId]
+      );
+
+      if (essayQuestions.length === 0) {
+        return res.status(400).json({ message: 'No essay questions found for this step' });
+      }
+
+      // Scoring algorithm
+      let totalScore = 0;
+      let allMatchedKeywords = [];
+      let totalKeywords = 0;
+      let isPerfectMatch = false;
+
+      // Helper function to calculate similarity between two strings
+      const calculateSimilarity = (str1, str2) => {
+        const normalize = (str) => str
+          .toLowerCase()
+          .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        const s1 = normalize(str1);
+        const s2 = normalize(str2);
+
+        if (s1 === s2) return 100;
+        if (s1.length === 0 || s2.length === 0) return 0;
+
+        // Calculate Levenshtein distance
+        const matrix = [];
+        for (let i = 0; i <= s2.length; i++) {
+          matrix[i] = [i];
+        }
+        for (let j = 0; j <= s1.length; j++) {
+          matrix[0][j] = j;
+        }
+        for (let i = 1; i <= s2.length; i++) {
+          for (let j = 1; j <= s1.length; j++) {
+            if (s2.charAt(i - 1) === s1.charAt(j - 1)) {
+              matrix[i][j] = matrix[i - 1][j - 1];
+            } else {
+              matrix[i][j] = Math.min(
+                matrix[i - 1][j - 1] + 1,
+                matrix[i][j - 1] + 1,
+                matrix[i - 1][j] + 1
+              );
+            }
+          }
+        }
+
+        const distance = matrix[s2.length][s1.length];
+        const maxLength = Math.max(s1.length, s2.length);
+        return ((maxLength - distance) / maxLength) * 100;
+      };
+
+      for (const eq of essayQuestions) {
+        const safeParseList = (data) => {
+          if (!data) return [];
+          try {
+            const parsed = JSON.parse(data);
+            if (Array.isArray(parsed)) return parsed;
+            return [];
+          } catch (e) {
+            return String(data).split(',').map(s => s.trim()).filter(Boolean);
+          }
+        };
+
+        const keywords = safeParseList(eq.keywords);
+        const synonyms = safeParseList(eq.synonyms);
+        totalKeywords += keywords.length;
+
+        // Check if answer is very similar to perfect answer (85% or more)
+        if (eq.perfect_answer && eq.perfect_answer.trim()) {
+          const similarity = calculateSimilarity(essayAnswer, eq.perfect_answer);
+          if (similarity >= 85) {
+            // Award full marks for this question
+            totalScore += (eq.max_score || 10);
+            allMatchedKeywords.push(...keywords); // Mark all keywords as matched
+            isPerfectMatch = true;
+            continue; // Skip keyword checking for this question
+          }
+        }
+
+        // Normalize answer - remove punctuation and convert to lowercase
+        const normalizedAnswer = essayAnswer
+          .toLowerCase()
+          .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        // Check keyword matches
+        const matchedKeywords = [];
+        for (const keyword of keywords) {
+          const normalizedKeyword = keyword.toLowerCase();
+
+          // Check if keyword or any synonym is in the answer
+          const keywordMatch = normalizedAnswer.includes(normalizedKeyword);
+          const synonymMatch = synonyms.some(syn =>
+            normalizedAnswer.includes(syn.toLowerCase())
+          );
+
+          if (keywordMatch || synonymMatch) {
+            matchedKeywords.push(keyword);
+          }
+        }
+
+        allMatchedKeywords.push(...matchedKeywords);
+
+        // Calculate score for this question
+        const questionScore = keywords.length > 0
+          ? (matchedKeywords.length / keywords.length) * (eq.max_score || 10)
+          : 0;
+
+        totalScore += questionScore;
+      }
+
+      // Get step info for maxScore
+      const [stepRows] = await pool.query(
+        `SELECT maxScore FROM case_steps WHERE id = ?`,
+        [stepId]
+      );
+      const stepMaxScore = stepRows[0]?.maxScore || 10;
+
+      // Normalize score to step's maxScore
+      const finalScore = Math.min(totalScore, stepMaxScore);
+      const isCorrect = finalScore >= (stepMaxScore * 0.6); // 60% threshold
+
+      // Record the attempt
+      await pool.query(
+        `INSERT INTO step_attempts 
+         (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.user.id,
+          caseId,
+          stepId,
+          isCorrect ? 1 : 0,
+          timeSpent || 0,
+          hintShown ? 1 : 0,
+          attemptNumber || 1,
+          essayAnswer,
+          JSON.stringify(allMatchedKeywords)
+        ]
+      );
+
+      // If final step, update progress
+      if (isFinalStep) {
+        const [scoreRows] = await pool.query(
+          `SELECT SUM(cs.maxScore) as totalScore
+           FROM step_attempts sa
+           JOIN case_steps cs ON sa.stepId = cs.id
+           WHERE sa.caseId = ? AND sa.userId = ? AND sa.isCorrect = 1
+           AND sa.id IN (
+               SELECT MAX(id) FROM step_attempts 
+               WHERE caseId = ? AND userId = ? 
+               GROUP BY stepId
+           )`,
+          [caseId, req.user.id, caseId, req.user.id]
+        );
+        const totalCaseScore = scoreRows[0].totalScore || 0;
+
+        await pool.query(
+          `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt)
+           VALUES (?, ?, ?, 1, NOW())
+           ON DUPLICATE KEY UPDATE score = VALUES(score), isCompleted = 1, createdAt = VALUES(createdAt)`,
+          [req.user.id, caseId, totalCaseScore]
+        );
+
+        const [statsRows] = await pool.query(
+          `SELECT 
+             COUNT(DISTINCT caseId) as casesCompleted,
+             SUM(score) as totalScore
+           FROM progress
+           WHERE userId = ? AND isCompleted = 1`,
+          [req.user.id]
+        );
+        const stats = statsRows[0];
+
+        res.json({
+          correct: isCorrect,
+          final: true,
+          score: Math.round(finalScore),
+          maxScore: stepMaxScore,
+          matchedKeywords: allMatchedKeywords,
+          totalKeywords: totalKeywords,
+          feedback: isPerfectMatch
+            ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
+            : isCorrect
+              ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+              : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`,
+          stats: {
+            casesCompleted: stats.casesCompleted || 0,
+            totalScore: stats.totalScore || 0,
+          }
+        });
+      } else {
+        res.json({
+          correct: isCorrect,
+          score: Math.round(finalScore),
+          maxScore: stepMaxScore,
+          matchedKeywords: allMatchedKeywords,
+          totalKeywords: totalKeywords,
+          feedback: isPerfectMatch
+            ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
+            : isCorrect
+              ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+              : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`
+        });
+      }
+
+    } catch (err) {
+      console.error('Essay answer error:', err);
+      res.status(500).json({ message: 'Database error' });
+    }
+  }
+);
+
 
 app.get('/api/stats/me', authMiddleware(), async (req, res) => {
   try {
@@ -1816,6 +2143,7 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
   const { id } = req.params;
   try {
     const [steps] = await pool.query(`SELECT * FROM case_steps WHERE caseId = ? ORDER BY stepIndex ASC`, [id]);
+    console.log(`[DEBUG] Fetched ${steps.length} steps for case ${id}`);
 
     const stepIds = steps.map((s) => s.id);
     if (stepIds.length === 0) return res.json([]);
@@ -1826,12 +2154,51 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
     const [invs] = await pool.query(`SELECT * FROM investigations WHERE stepId IN (${placeholders})`, stepIds);
     const [xrays] = await pool.query(`SELECT * FROM xrays WHERE stepId IN (${placeholders})`, stepIds);
 
+    let essayQuestions = [];
+    try {
+      console.log(`[DEBUG] Fetching essay questions for steps: ${stepIds.join(',')}`);
+      const [rows] = await pool.query(`SELECT * FROM essay_questions WHERE step_id IN (${placeholders})`, stepIds);
+      essayQuestions = rows;
+      console.log(`[DEBUG] Fetched ${essayQuestions.length} essay questions`);
+    } catch (err) {
+      console.error(`[DEBUG] Error fetching essay questions:`, err.message);
+      essayQuestions = [];
+    }
+
     const detailedSteps = steps.map((s) => ({
       ...s,
-      content: s.content ? JSON.parse(s.content) : {},
+      content: (() => {
+        try {
+          return s.content ? JSON.parse(s.content) : {};
+        } catch (e) {
+          console.warn(`Failed to parse content for step ${s.id}:`, e.message);
+          return {};
+        }
+      })(),
       options: options.filter(o => o.stepId === s.id).map(o => ({ ...o, isCorrect: !!o.isCorrect })),
       investigations: invs.filter(i => i.stepId === s.id),
       xrays: xrays.filter(x => x.stepId === s.id),
+      essayQuestions: essayQuestions.filter(eq => eq.step_id === s.id).map(eq => {
+        const safeParseList = (data) => {
+          if (!data) return [];
+          try {
+            const parsed = JSON.parse(data);
+            // Verify it is an array
+            if (Array.isArray(parsed)) return parsed;
+            return [];
+          } catch (e) {
+            // If parse fails, assume it is a comma-separated string
+            return String(data).split(',').map(s => s.trim()).filter(Boolean);
+          }
+        };
+
+        return {
+          ...eq,
+          keywords: safeParseList(eq.keywords),
+          synonyms: safeParseList(eq.synonyms),
+          perfect_answer: eq.perfect_answer || ''
+        };
+      }),
       tag: s.tag,
       expected_time: s.expected_time,
       hint_text: s.hint_text,
@@ -1847,7 +2214,7 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
 // POST new step
 app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, hint_text, tag, expected_time, hint_enabled } = req.body;
+  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled } = req.body;
 
   try {
     const [result] = await pool.query(
@@ -1886,6 +2253,16 @@ app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res)
       }
     }
 
+    // Insert Essay Questions
+    if (essayQuestions && essayQuestions.length > 0) {
+      for (const eq of essayQuestions) {
+        await pool.query(
+          `INSERT INTO essay_questions (step_id, question_text, keywords, synonyms, max_score, perfect_answer) VALUES (?, ?, ?, ?, ?, ?)`,
+          [stepId, eq.question_text, JSON.stringify(eq.keywords || []), JSON.stringify(eq.synonyms || []), eq.max_score || maxScore, eq.perfect_answer || null]
+        );
+      }
+    }
+
     res.json({ id: stepId, message: 'Step created' });
   } catch (err) {
     console.error(err);
@@ -1896,7 +2273,7 @@ app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res)
 // PUT update step
 app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, hint_text, tag, expected_time, hint_enabled } = req.body;
+  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled } = req.body;
 
   try {
     await pool.query(
@@ -1908,6 +2285,7 @@ app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
     await pool.query(`DELETE FROM case_step_options WHERE stepId = ?`, [id]);
     await pool.query(`DELETE FROM investigations WHERE stepId = ?`, [id]);
     await pool.query(`DELETE FROM xrays WHERE stepId = ?`, [id]);
+    await pool.query(`DELETE FROM essay_questions WHERE step_id = ?`, [id]);
 
     // Re-Insert Options
     if (options && options.length > 0) {
@@ -1935,6 +2313,16 @@ app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
         await pool.query(
           `INSERT INTO xrays (stepId, label, icon, imageUrl) VALUES (?, ?, ?, ?)`,
           [id, x.label, x.icon, x.imageUrl]
+        );
+      }
+    }
+
+    // Re-Insert Essay Questions
+    if (essayQuestions && essayQuestions.length > 0) {
+      for (const eq of essayQuestions) {
+        await pool.query(
+          `INSERT INTO essay_questions (step_id, question_text, keywords, synonyms, max_score, perfect_answer) VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, eq.question_text, JSON.stringify(eq.keywords || []), JSON.stringify(eq.synonyms || []), eq.max_score || maxScore, eq.perfect_answer || null]
         );
       }
     }
