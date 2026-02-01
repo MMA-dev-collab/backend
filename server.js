@@ -4,6 +4,9 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
+const helmet = require("helmet");
+const { z } = require("zod");
+const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const { sendVerificationEmail } = require('./utils/mailer-resend');
 const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
@@ -41,8 +44,86 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 /* ======================
    MIDDLEWARE
 ====================== */
-app.use(cors());
-app.use(express.json({ limit: '10mb' })); // Increased limit for base64 images
+// Security headers
+app.use(helmet());
+
+// CORS configuration
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : ['http://localhost:3000', 'http://localhost:5173'];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.) in dev
+    if (!origin && process.env.NODE_ENV !== 'production') {
+      return callback(null, true);
+    }
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS] Blocked request from origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
+
+/* ======================
+   RATE LIMITING
+====================== */
+// Global rate limiter: 100 requests per 15 minutes
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { message: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RATE LIMIT] Global limit exceeded for IP: ${req.ip}`);
+    res.status(429).json(options.message);
+  }
+});
+app.use(globalLimiter);
+
+// Auth rate limiter: 5 requests per minute (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 5,
+  message: { message: 'Too many authentication attempts, please try again in a minute.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RATE LIMIT] Auth limit exceeded for IP: ${req.ip}`);
+    res.status(429).json(options.message);
+  }
+});
+
+// Search rate limiter: 30 requests per minute
+const searchLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 30,
+  message: { message: 'Too many search requests, please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RATE LIMIT] Search limit exceeded for IP: ${req.ip}`);
+    res.status(429).json(options.message);
+  }
+});
+
+/* ======================
+   INPUT VALIDATION SCHEMAS
+====================== */
+const searchQuerySchema = z.object({
+  search: z.string().max(200).regex(/^[a-zA-Z0-9\u0600-\u06FF\s\-_]*$/, 'Invalid search characters').optional().default(''),
+  category: z.string().optional().default('all'),
+  difficulty: z.enum(['Beginner', 'Intermediate', 'Advanced', 'all']).optional().default('all'),
+  duration: z.enum(['short', 'medium', 'long', 'all']).optional().default('all'),
+  page: z.coerce.number().int().min(1).max(1000).optional().default(1),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(9)
+});
 
 
 /* ======================
@@ -323,8 +404,7 @@ function authMiddleware(requiredRole) {
 /* ======================
    AUTH ROUTES
 ====================== */
-// Rate Limiter for Registration
-const rateLimit = require("express-rate-limit");
+// Rate Limiter for Registration (uses rateLimit defined globally)
 const registerLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5, // Limit each IP to 5 registration requests per windowMs
@@ -669,7 +749,7 @@ app.post("/api/auth/resend-code", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
 
   const { identifier, password } = req.body; // identifier can be email or phone
@@ -865,234 +945,245 @@ app.post("/api/auth/login", async (req, res) => {
    (PASTE THEM EXACTLY AS THEY ARE)
 ====================== */
 
-// SEED OPTION - REMOVE IN PRODUCTION
-app.get('/api/dev/status-check', async (req, res) => {
-  try {
-    if (!pool) return res.status(503).json({ message: "DB unavailable" });
-    const [rows] = await pool.query("SELECT status, COUNT(*) as count FROM cases GROUP BY status");
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to check status" });
-  }
-});
-
-app.post('/api/dev/publish-all', async (req, res) => {
-  try {
-    if (!pool) return res.status(503).json({ message: "DB unavailable" });
-    await pool.query("UPDATE cases SET status = 'published'");
-    res.json({ message: "All cases published" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to publish cases" });
-  }
-});
-
-app.post('/api/dev/seed', async (req, res) => {
-  try {
-    if (!pool) return res.status(503).json({ message: "DB unavailable" });
-
-    // 1. Create Users
-    const usersData = [
-      { email: 'student1@test.com', name: 'Alice Student', role: 'student' },
-      { email: 'student2@test.com', name: 'Bob User', role: 'student' },
-      { email: 'student3@test.com', name: 'Charlie Learner', role: 'student' }
-    ];
-
-    const passwordHash = bcrypt.hashSync('password123', 10);
-    const userIds = [];
-
-    for (const u of usersData) {
-      const [result] = await pool.query(
-        `INSERT INTO users (email, passwordHash, role, name) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)`,
-        [u.email, passwordHash, u.role, u.name]
-      );
-
-      if (result.insertId) {
-        userIds.push(result.insertId);
-      } else {
-        // If insertId is 0 (which can happen with ON DUPLICATE KEY UPDATE if no change), fetch the ID
-        const [rows] = await pool.query(`SELECT id FROM users WHERE email = ?`, [u.email]);
-        if (rows.length > 0) userIds.push(rows[0].id);
-      }
+/* ======================
+   DEVELOPMENT ONLY ROUTES - NOT REGISTERED IN PRODUCTION
+====================== */
+if (process.env.NODE_ENV !== 'production') {
+  // Status check endpoint (dev only)
+  app.get('/api/dev/status-check', async (req, res) => {
+    try {
+      if (!pool) return res.status(503).json({ message: "DB unavailable" });
+      const [rows] = await pool.query("SELECT status, COUNT(*) as count FROM cases GROUP BY status");
+      res.json(rows);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Failed to check status" });
     }
+  });
 
-    // 2. Create 4 Complete Cases with Steps
-    const casesData = [
-      {
-        title: 'Knee Pain Assessment',
-        difficulty: 'Beginner',
-        category: 'Orthopedics',
-        steps: [
-          {
-            type: 'info',
-            stepIndex: 0,
-            content: JSON.stringify({
-              patientName: 'John Smith',
-              age: 45,
-              gender: 'Male',
-              description: 'Patient presents with chronic knee pain',
-              chiefComplaint: 'ألم في الركبة منذ 3 أشهر'
-            })
-          },
-          {
-            type: 'mcq',
-            stepIndex: 1,
-            question: 'What is the first step in assessment?',
-            maxScore: 10,
-            options: [
-              { label: 'Order MRI immediately', isCorrect: false, feedback: 'Too aggressive for initial assessment' },
-              { label: 'Physical examination', isCorrect: true, feedback: 'Correct! Always start with physical exam' },
-              { label: 'Prescribe pain medication', isCorrect: false, feedback: 'Need assessment first' }
-            ]
-          }
-        ]
-      },
-      {
-        title: 'Chest Pain Evaluation',
-        difficulty: 'Intermediate',
-        category: 'Cardiology',
-        steps: [
-          {
-            type: 'info',
-            stepIndex: 0,
-            content: JSON.stringify({
-              patientName: 'Sarah Johnson',
-              age: 62,
-              gender: 'Female',
-              description: 'Acute chest pain radiating to left arm',
-              chiefComplaint: 'ألم في الصدر منذ ساعة'
-            })
-          },
-          {
-            type: 'mcq',
-            stepIndex: 1,
-            question: 'What is the most urgent action?',
-            maxScore: 15,
-            options: [
-              { label: 'ECG and cardiac markers', isCorrect: true, feedback: 'Correct! Rule out MI immediately' },
-              { label: 'Schedule stress test', isCorrect: false, feedback: 'Too slow for acute presentation' },
-              { label: 'Give antacids', isCorrect: false, feedback: 'Dangerous assumption' }
-            ]
-          }
-        ]
-      },
-      {
-        title: 'Pediatric Fever Management',
-        difficulty: 'Intermediate',
-        category: 'Pediatrics',
-        steps: [
-          {
-            type: 'info',
-            stepIndex: 0,
-            content: JSON.stringify({
-              patientName: 'Emma Davis',
-              age: 3,
-              gender: 'Female',
-              description: 'High fever 39.5°C for 2 days',
-              chiefComplaint: 'حمى عالية منذ يومين'
-            })
-          },
-          {
-            type: 'mcq',
-            stepIndex: 1,
-            question: 'What is the priority assessment?',
-            maxScore: 12,
-            options: [
-              { label: 'Check for meningeal signs', isCorrect: true, feedback: 'Correct! Critical in febrile child' },
-              { label: 'Give antibiotics immediately', isCorrect: false, feedback: 'Need diagnosis first' },
-              { label: 'Send home with antipyretics', isCorrect: false, feedback: 'Need full assessment' }
-            ]
-          }
-        ]
-      },
-      {
-        title: 'Headache Diagnosis',
-        difficulty: 'Advanced',
-        category: 'Neurology',
-        steps: [
-          {
-            type: 'info',
-            stepIndex: 0,
-            content: JSON.stringify({
-              patientName: 'Michael Brown',
-              age: 38,
-              gender: 'Male',
-              description: 'Sudden severe headache, worst of life',
-              chiefComplaint: 'صداع شديد مفاجئ'
-            })
-          },
-          {
-            type: 'mcq',
-            stepIndex: 1,
-            question: 'What is the most concerning diagnosis?',
-            maxScore: 20,
-            options: [
-              { label: 'Migraine', isCorrect: false, feedback: 'Unlikely with sudden onset' },
-              { label: 'Subarachnoid hemorrhage', isCorrect: true, feedback: 'Correct! "Thunderclap" headache is classic' },
-              { label: 'Tension headache', isCorrect: false, feedback: 'Not sudden or severe' }
-            ]
-          }
-        ]
+  // Bulk publish endpoint (dev only)
+  app.post('/api/dev/publish-all', async (req, res) => {
+    try {
+      if (!pool) return res.status(503).json({ message: "DB unavailable" });
+      await pool.query("UPDATE cases SET status = 'published'");
+      res.json({ message: "All cases published" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Failed to publish cases" });
+    }
+  });
+
+  // Database seeding endpoint (dev only)
+  app.post('/api/dev/seed', async (req, res) => {
+    try {
+      if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
+      // 1. Create Users
+      const usersData = [
+        { email: 'student1@test.com', name: 'Alice Student', role: 'student' },
+        { email: 'student2@test.com', name: 'Bob User', role: 'student' },
+        { email: 'student3@test.com', name: 'Charlie Learner', role: 'student' }
+      ];
+
+      const passwordHash = bcrypt.hashSync('password123', 10);
+      const userIds = [];
+
+      for (const u of usersData) {
+        const [result] = await pool.query(
+          `INSERT INTO users (email, passwordHash, role, name) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)`,
+          [u.email, passwordHash, u.role, u.name]
+        );
+
+        if (result.insertId) {
+          userIds.push(result.insertId);
+        } else {
+          // If insertId is 0 (which can happen with ON DUPLICATE KEY UPDATE if no change), fetch the ID
+          const [rows] = await pool.query(`SELECT id FROM users WHERE email = ?`, [u.email]);
+          if (rows.length > 0) userIds.push(rows[0].id);
+        }
       }
-    ];
 
-    const caseIds = [];
-    for (const caseData of casesData) {
-      // Insert case
-      const [caseResult] = await pool.query(
-        `INSERT INTO cases (title, difficulty, category, duration, isLocked) VALUES (?, ?, ?, 15, 0)`,
-        [caseData.title, caseData.difficulty, caseData.category]
-      );
-      const caseId = caseResult.insertId;
+      // 2. Create 4 Complete Cases with Steps
+      const casesData = [
+        {
+          title: 'Knee Pain Assessment',
+          difficulty: 'Beginner',
+          category: 'Orthopedics',
+          steps: [
+            {
+              type: 'info',
+              stepIndex: 0,
+              content: JSON.stringify({
+                patientName: 'John Smith',
+                age: 45,
+                gender: 'Male',
+                description: 'Patient presents with chronic knee pain',
+                chiefComplaint: 'ألم في الركبة منذ 3 أشهر'
+              })
+            },
+            {
+              type: 'mcq',
+              stepIndex: 1,
+              question: 'What is the first step in assessment?',
+              maxScore: 10,
+              options: [
+                { label: 'Order MRI immediately', isCorrect: false, feedback: 'Too aggressive for initial assessment' },
+                { label: 'Physical examination', isCorrect: true, feedback: 'Correct! Always start with physical exam' },
+                { label: 'Prescribe pain medication', isCorrect: false, feedback: 'Need assessment first' }
+              ]
+            }
+          ]
+        },
+        {
+          title: 'Chest Pain Evaluation',
+          difficulty: 'Intermediate',
+          category: 'Cardiology',
+          steps: [
+            {
+              type: 'info',
+              stepIndex: 0,
+              content: JSON.stringify({
+                patientName: 'Sarah Johnson',
+                age: 62,
+                gender: 'Female',
+                description: 'Acute chest pain radiating to left arm',
+                chiefComplaint: 'ألم في الصدر منذ ساعة'
+              })
+            },
+            {
+              type: 'mcq',
+              stepIndex: 1,
+              question: 'What is the most urgent action?',
+              maxScore: 15,
+              options: [
+                { label: 'ECG and cardiac markers', isCorrect: true, feedback: 'Correct! Rule out MI immediately' },
+                { label: 'Schedule stress test', isCorrect: false, feedback: 'Too slow for acute presentation' },
+                { label: 'Give antacids', isCorrect: false, feedback: 'Dangerous assumption' }
+              ]
+            }
+          ]
+        },
+        {
+          title: 'Pediatric Fever Management',
+          difficulty: 'Intermediate',
+          category: 'Pediatrics',
+          steps: [
+            {
+              type: 'info',
+              stepIndex: 0,
+              content: JSON.stringify({
+                patientName: 'Emma Davis',
+                age: 3,
+                gender: 'Female',
+                description: 'High fever 39.5°C for 2 days',
+                chiefComplaint: 'حمى عالية منذ يومين'
+              })
+            },
+            {
+              type: 'mcq',
+              stepIndex: 1,
+              question: 'What is the priority assessment?',
+              maxScore: 12,
+              options: [
+                { label: 'Check for meningeal signs', isCorrect: true, feedback: 'Correct! Critical in febrile child' },
+                { label: 'Give antibiotics immediately', isCorrect: false, feedback: 'Need diagnosis first' },
+                { label: 'Send home with antipyretics', isCorrect: false, feedback: 'Need full assessment' }
+              ]
+            }
+          ]
+        },
+        {
+          title: 'Headache Diagnosis',
+          difficulty: 'Advanced',
+          category: 'Neurology',
+          steps: [
+            {
+              type: 'info',
+              stepIndex: 0,
+              content: JSON.stringify({
+                patientName: 'Michael Brown',
+                age: 38,
+                gender: 'Male',
+                description: 'Sudden severe headache, worst of life',
+                chiefComplaint: 'صداع شديد مفاجئ'
+              })
+            },
+            {
+              type: 'mcq',
+              stepIndex: 1,
+              question: 'What is the most concerning diagnosis?',
+              maxScore: 20,
+              options: [
+                { label: 'Migraine', isCorrect: false, feedback: 'Unlikely with sudden onset' },
+                { label: 'Subarachnoid hemorrhage', isCorrect: true, feedback: 'Correct! "Thunderclap" headache is classic' },
+                { label: 'Tension headache', isCorrect: false, feedback: 'Not sudden or severe' }
+              ]
+            }
+          ]
+        }
+      ];
 
-      if (caseId) {
-        caseIds.push(caseId);
+      const caseIds = [];
+      for (const caseData of casesData) {
+        // Insert case
+        const [caseResult] = await pool.query(
+          `INSERT INTO cases (title, difficulty, category, duration, isLocked) VALUES (?, ?, ?, 15, 0)`,
+          [caseData.title, caseData.difficulty, caseData.category]
+        );
+        const caseId = caseResult.insertId;
 
-        // Insert steps for this case
-        for (const step of caseData.steps) {
-          const [stepResult] = await pool.query(
-            `INSERT INTO case_steps (caseId, stepIndex, type, content, question, maxScore) VALUES (?, ?, ?, ?, ?, ?)`,
-            [caseId, step.stepIndex, step.type, step.content || null, step.question || null, step.maxScore || 0]
-          );
-          const stepId = stepResult.insertId;
+        if (caseId) {
+          caseIds.push(caseId);
 
-          // Insert options if this is an MCQ step
-          if (step.options && stepId) {
-            for (const option of step.options) {
-              await pool.query(
-                `INSERT INTO case_step_options (stepId, label, isCorrect, feedback) VALUES (?, ?, ?, ?)`,
-                [stepId, option.label, option.isCorrect ? 1 : 0, option.feedback]
-              );
+          // Insert steps for this case
+          for (const step of caseData.steps) {
+            const [stepResult] = await pool.query(
+              `INSERT INTO case_steps (caseId, stepIndex, type, content, question, maxScore) VALUES (?, ?, ?, ?, ?, ?)`,
+              [caseId, step.stepIndex, step.type, step.content || null, step.question || null, step.maxScore || 0]
+            );
+            const stepId = stepResult.insertId;
+
+            // Insert options if this is an MCQ step
+            if (step.options && stepId) {
+              for (const option of step.options) {
+                await pool.query(
+                  `INSERT INTO case_step_options (stepId, label, isCorrect, feedback) VALUES (?, ?, ?, ?)`,
+                  [stepId, option.label, option.isCorrect ? 1 : 0, option.feedback]
+                );
+              }
             }
           }
         }
       }
-    }
 
-    // 3. Create Progress (Completed) for users
-    for (const uid of userIds) {
-      for (const cid of caseIds) {
-        const score = Math.floor(Math.random() * 50) + 50; // 50-100
-        await pool.query(
-          `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt) VALUES (?, ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE score = VALUES(score)`,
-          [uid, cid, score]
-        );
+      // 3. Create Progress (Completed) for users
+      for (const uid of userIds) {
+        for (const cid of caseIds) {
+          const score = Math.floor(Math.random() * 50) + 50; // 50-100
+          await pool.query(
+            `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt) VALUES (?, ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE score = VALUES(score)`,
+            [uid, cid, score]
+          );
+        }
       }
+
+      res.json({
+        message: 'Seeding complete',
+        users: userIds.length,
+        cases: caseIds.length,
+        details: 'Created 3 users and 4 complete cases with steps and options'
+      });
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: 'Seeding failed', error: error.message });
     }
+  });
 
-    res.json({
-      message: 'Seeding complete',
-      users: userIds.length,
-      cases: caseIds.length,
-      details: 'Created 3 users and 4 complete cases with steps and options'
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Seeding failed', error: error.message });
-  }
-});
+  console.log('🔧 Development routes registered: /api/dev/*');
+} else {
+  console.log('🔒 Production mode: /api/dev/* routes are disabled');
+}
 
 
 
@@ -1189,18 +1280,20 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
   }
 });
 
-app.get('/api/cases', async (req, res) => {
+app.get('/api/cases', searchLimiter, async (req, res) => {
   try {
-    // Pagination parameters
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 9;
-    const offset = (page - 1) * limit;
+    // Validate query parameters with Zod schema
+    const validationResult = searchQuerySchema.safeParse(req.query);
+    if (!validationResult.success) {
+      console.warn(`[SECURITY] Invalid search params from IP ${req.ip}:`, validationResult.error.flatten());
+      return res.status(400).json({
+        message: 'Invalid search parameters',
+        errors: validationResult.error.flatten().fieldErrors
+      });
+    }
 
-    // Filter parameters
-    const search = req.query.search || '';
-    const category = req.query.category || 'all';
-    const difficulty = req.query.difficulty || 'all';
-    const duration = req.query.duration || 'all';
+    const { search, category, difficulty, duration, page, limit } = validationResult.data;
+    const offset = (page - 1) * limit;
 
     // Optional Auth Logic
     let userId = null;
@@ -3242,6 +3335,20 @@ app.get('/api/steps/:stepId/hint', authMiddleware(), async (req, res) => {
     console.error('Hint retrieval error:', err);
     res.status(500).json({ message: 'Database error' });
   }
+});
+
+/* ======================
+   GLOBAL ERROR HANDLER (SECURITY)
+====================== */
+app.use((err, req, res, next) => {
+  console.error('[ERROR]', err);
+
+  // Don't leak stack traces or internal errors in production
+  const message = process.env.NODE_ENV === 'production'
+    ? 'Internal server error'
+    : err.message || 'Internal server error';
+
+  res.status(err.status || 500).json({ message });
 });
 
 /* ======================
