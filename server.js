@@ -11,6 +11,8 @@ const crypto = require("crypto");
 const { sendVerificationEmail } = require('./utils/mailer-resend');
 const { getClientIP, getDeviceFingerprint, getDeviceType, matchDevice, isValidIP, findAvailableSlot } = require('./utils/ip-helper');
 const { calculateEndDate, convertToDays, getUserMembership, checkCaseAccess, formatDuration, getPlanHierarchy } = require('./utils/subscription-helper');
+const { uploadImage } = require('./services/uploadService');
+const { uploadMiddleware, validateImageDimensions } = require('./middleware/uploadMiddleware');
 
 const app = express();
 
@@ -45,7 +47,10 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
    MIDDLEWARE
 ====================== */
 // Security headers
-app.use(helmet());
+// Security headers
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
 
 // CORS configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -69,6 +74,9 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '10mb' }));
+
+// Serve static files from 'uploads' directory
+app.use('/uploads', express.static('uploads'));
 
 /* ======================
    RATE LIMITING
@@ -131,6 +139,51 @@ const searchQuerySchema = z.object({
 ====================== */
 app.get("/", (req, res) => {
   res.json({ status: "OK" });
+});
+
+// Upload rate limiter: 10 requests per 10 minutes
+const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  message: { message: 'Upload limit exceeded. Please wait 10 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+/* ======================
+   UPLOAD ROUTES
+====================== */
+app.post('/api/upload', authMiddleware('admin'), uploadLimiter, uploadMiddleware, validateImageDimensions, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No image file provided' });
+    }
+
+    const type = req.body.type;
+    let folder = 'physiosim/misc';
+
+    if (type === 'case-cover') {
+      folder = 'physiosim/case-covers';
+    } else if (type === 'step-image') {
+      folder = 'physiosim/steps/info-images';
+    } else {
+      // Optional: Reject unknown types or default to misc
+      // return res.status(400).json({ message: 'Invalid upload type' });
+    }
+
+    // Upload to Cloudinary
+    const result = await uploadImage(req.file.buffer, folder);
+
+    res.json({
+      message: 'Upload successful',
+      url: result.url,
+      publicId: result.publicId
+    });
+
+  } catch (error) {
+    console.error('Upload Endpoint Error:', error);
+    res.status(500).json({ message: 'Upload failed', error: error.message });
+  }
 });
 
 
