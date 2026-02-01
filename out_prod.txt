@@ -1,6 +1,0 @@
-[dotenv@17.2.3] injecting env (7) from .env -- tip: ظ£à audit secrets and track compliance: https://dotenvx.com/ops
-≡اôد Mailer Config: Provider: Resend API (HTTPS)
-ظأبي╕  No specific trusted proxies configured. trusting hop count: 1.
-DEBUG: About to listen on port 4000
-≡اأ Backend running on port 4000
-ظ£à Database connected
