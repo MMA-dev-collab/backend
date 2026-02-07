@@ -95,6 +95,23 @@ const globalLimiter = rateLimit({
 });
 app.use(globalLimiter);
 
+// NEW: Burst rate limiter: 50 requests per 1 minute (DoS protection)
+const burstLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 50,
+  message: { message: 'Too many requests, please slow down.' },
+  standardHeaders: true, // Return RateLimit headers
+  legacyHeaders: false,
+  handler: (req, res, next, options) => {
+    console.warn(`[RATE LIMIT] Burst limit exceeded for IP: ${req.ip}`);
+    res.status(429).json(options.message);
+  },
+  // Redis Scalability Note:
+  // In a multi-instance environment, replace MemoryStore with RedisStore (rate-limit-redis)
+  // to share rate limit state across all server instances.
+});
+app.use(burstLimiter);
+
 // Auth rate limiter: 5 requests per minute (brute-force protection)
 const authLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
@@ -692,7 +709,7 @@ app.post("/api/auth/register", registerLimiter, async (req, res) => {
   }
 });
 
-app.post("/api/auth/verify-email", async (req, res) => {
+app.post("/api/auth/verify-email", authLimiter, async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
   const { userId, code } = req.body;
 
@@ -773,7 +790,7 @@ app.post("/api/auth/verify-email", async (req, res) => {
   }
 });
 
-app.post("/api/auth/resend-code", async (req, res) => {
+app.post("/api/auth/resend-code", authLimiter, async (req, res) => {
   if (!pool) return res.status(503).json({ message: "DB unavailable" });
   const { userId } = req.body;
 
