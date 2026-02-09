@@ -67,12 +67,8 @@ async function sendVerificationEmail(email, code) {
                             <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 30px;">
                                 <tr>
                                     <td align="center">
-                                        <div style="width: 80px; height: 80px; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto;">
-                                            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                                <path d="M22 10.5V15.5C22 19 20 20.5 17 20.5H7C4 20.5 2 19 2 15.5V8.5C2 5 4 3.5 7 3.5H14" stroke="#3b82f6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                                                <path d="M7 9L10.13 11.5C10.97 12.16 12.02 12.16 12.86 11.5L17 8" stroke="#3b82f6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                                                <path d="M19.5 7.5C20.3284 7.5 21 6.82843 21 6C21 5.17157 20.3284 4.5 19.5 4.5C18.6716 4.5 18 5.17157 18 6C18 6.82843 18.6716 7.5 19.5 7.5Z" stroke="#3b82f6" stroke-width="1.5"/>
-                                            </svg>
+                                        <div style="width: 200px; height: 200px; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto;">
+                                            <img alt="TestNew" src="https://res.cloudinary.com/dhicz31vg/image/upload/v1770662884/WhatsApp_Image_2026-02-07_at_12.41.01_AM_x6qg6l.jpg">
                                         </div>
                                     </td>
                                 </tr>
