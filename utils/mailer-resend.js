@@ -89,6 +89,7 @@ async function sendVerificationEmail(email, code) {
                                 <tr>
                                     <td align="center">
                                         <div style="background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%); border-radius: 16px; padding: 30px; border: 1px solid #e2e8f0;">
+
                                             <p style="color: #475569; font-size: 14px; font-weight: 600; margin: 0 0 15px 0; text-transform: uppercase; letter-spacing: 1px;">
                                                 Your Verification Code
                                             </p>
