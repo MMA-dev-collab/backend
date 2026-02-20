@@ -81,9 +81,9 @@ app.use('/uploads', express.static('uploads'));
 /* ======================
    RATE LIMITING
 ====================== */
-// Global rate limiter: 100 requests per 15 minutes
+// Global rate limiter: 100 requests per 5 minutes
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 5 * 60 * 1000,
   max: 100,
   message: { message: 'Too many requests, please try again later.' },
   standardHeaders: true,
@@ -1579,11 +1579,22 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       id: s.id,
       stepIndex: s.stepIndex,
       type: s.type,
+      phase: s.phase,
+      category: s.category,
+      input_mode: s.input_mode,
       content: (() => {
         try {
           return s.content ? JSON.parse(s.content) : null;
         } catch (e) {
           console.warn(`Failed to parse content for step ${s.id}:`, e.message);
+          return null;
+        }
+      })(),
+      logic: (() => {
+        try {
+          return s.logic ? JSON.parse(s.logic) : null;
+        } catch (e) {
+          console.warn(`Failed to parse logic for step ${s.id}:`, e.message);
           return null;
         }
       })(),
@@ -2178,18 +2189,9 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
         `SELECT * FROM case_steps WHERE caseId = ? ORDER BY stepIndex ASC`,
         [id]
       );
-      const sc = stepRows.length;
-      if (sc < 3) {
+      if (stepRows.length === 0) {
         return res.status(400).json({
-          message: 'Cannot publish case with less than 3 steps. The case remains drafted.'
-        });
-      }
-
-      // MCQ Rule: Case must end with MCQ
-      const lastStep = stepRows[stepRows.length - 1];
-      if (lastStep.type !== 'mcq') {
-        return res.status(400).json({
-          message: 'A case must end with an MCQ step to assess the student.'
+          message: 'Cannot publish an empty case.'
         });
       }
     }
@@ -2338,6 +2340,14 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
           return {};
         }
       })(),
+      logic: (() => {
+        try {
+          return s.logic ? JSON.parse(s.logic) : null;
+        } catch (e) {
+          console.warn(`Failed to parse logic for step ${s.id}:`, e.message);
+          return null;
+        }
+      })(),
       options: options.filter(o => o.stepId === s.id).map(o => ({ ...o, isCorrect: !!o.isCorrect })),
       investigations: invs.filter(i => i.stepId === s.id),
       xrays: xrays.filter(x => x.stepId === s.id),
@@ -2377,12 +2387,12 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
 // POST new step
 app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled } = req.body;
+  const { stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO case_steps (caseId, stepIndex, type, content, question, explanationOnFail, maxScore, hint_text, tag, expected_time, hint_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1]
+      `INSERT INTO case_steps (caseId, stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, hint_text, tag, expected_time, hint_enabled, logic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, stepIndex, type, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null]
     );
     const stepId = result.insertId;
 
@@ -2436,12 +2446,12 @@ app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res)
 // PUT update step
 app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled } = req.body;
+  const { stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
 
   try {
     await pool.query(
-      `UPDATE case_steps SET stepIndex=?, type=?, content=?, question=?, explanationOnFail=?, maxScore=?, hint_text=?, tag=?, expected_time=?, hint_enabled=? WHERE id=?`,
-      [stepIndex, type, JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, id]
+      `UPDATE case_steps SET stepIndex=?, type=?, phase=?, category=?, input_mode=?, content=?, question=?, explanationOnFail=?, maxScore=?, hint_text=?, tag=?, expected_time=?, hint_enabled=?, logic=? WHERE id=?`,
+      [stepIndex, type, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null, id]
     );
 
     // Clean up related data to overwrite
@@ -2506,6 +2516,37 @@ app.delete('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => 
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// REORDER Steps
+app.put('/api/admin/cases/:id/reorder-steps', authMiddleware('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { steps } = req.body; // Array of { id, stepIndex }
+
+  if (!steps || !Array.isArray(steps)) {
+    return res.status(400).json({ message: 'Invalid steps data' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    for (const step of steps) {
+      await connection.query(
+        `UPDATE case_steps SET stepIndex = ? WHERE id = ? AND caseId = ?`,
+        [step.stepIndex, step.id, id]
+      );
+    }
+
+    await connection.commit();
+    res.json({ message: 'Steps reordered successfully' });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ message: 'Database error' });
+  } finally {
+    connection.release();
   }
 });
 
