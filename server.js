@@ -1433,7 +1433,7 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
        ${whereClause}
-       ORDER BY c.created_at DESC
+       ORDER BY isCompleted ASC, c.created_at DESC
        LIMIT ? OFFSET ?`;
       params = [userId, ...filterParams, limit, offset];
     } else {
@@ -1445,7 +1445,7 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
        LEFT JOIN categories cat ON c.categoryId = cat.id
        LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
        ${whereClause}
-       ORDER BY c.created_at DESC
+       ORDER BY isCompleted ASC, c.created_at DESC
        LIMIT ? OFFSET ?`;
       params = [...filterParams, limit, offset];
     }
@@ -1655,7 +1655,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
 
     // Load attempts if user is logged in
     const [attempts] = await pool.query(
-      `SELECT stepId, selectedOptionId, isCorrect, attemptNumber 
+      `SELECT stepId, selectedOptionId, isCorrect, attemptNumber, essay_answer 
        FROM step_attempts 
        WHERE caseId = ? AND userId = ?
        ORDER BY attemptNumber DESC`, // Get latest attempts
@@ -1669,7 +1669,8 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       if (!latestAttempts[a.stepId]) {
         latestAttempts[a.stepId] = {
           selectedOptionId: a.selectedOptionId,
-          isCorrect: !!a.isCorrect
+          isCorrect: !!a.isCorrect,
+          essay_answer: a.essay_answer
         };
       }
     });
