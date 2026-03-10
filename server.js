@@ -2585,7 +2585,7 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT id, email, role, name,
+      `SELECT id, email, role, name, profileImage, phone, email_verified,
               device1_ip, device1_last_seen, device2_ip, device2_last_seen,
               device_locked, token_version, createdAt
        FROM users
@@ -2628,10 +2628,11 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
           tokenVersion: row.token_version
         },
         createdAt: row.createdAt,
-        stats: {
-          casesCompleted: stats[0]?.casesCompleted || 0,
-          totalScore: stats[0]?.totalScore || 0,
-        },
+        profileImage: row.profileImage,
+        phone: row.phone,
+        email_verified: !!row.email_verified,
+        completedCases: stats[0]?.casesCompleted || 0,
+        totalPoints: stats[0]?.totalScore || 0,
       };
     }));
     res.json(users);
@@ -2857,11 +2858,41 @@ app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
 });
 
 
+// ======================
+//    PUBLIC SUBSCRIPTION ROUTES
+// ======================
 
+// Get all active subscription plans for public viewing
+app.get('/api/subscription-plans', async (req, res) => {
+  try {
+    const query = `SELECT * FROM subscription_plans WHERE isActive = 1 ORDER BY price ASC`;
+    const [rows] = await pool.query(query);
+
+    // Parse features JSON for each plan
+    const formattedPlans = rows.map(plan => {
+      let features = [];
+      try {
+        if (plan.features) {
+          features = JSON.parse(plan.features);
+        }
+      } catch (e) {
+        console.error(`Error parsing features for plan ${plan.id}:`, e);
+      }
+      return { ...plan, features };
+    });
+
+    res.json(formattedPlans);
+  } catch (error) {
+    console.error('Error fetching public subscription plans:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// ======================
 //    ADMIN SUBSCRIPTION ROUTES
 // ====================== */
 
-// Get all subscription plans
+// Get all subscription plans (Admin)
 app.get('/api/admin/subscription-plans', authMiddleware('admin'), async (req, res) => {
   try {
     const { activeOnly } = req.query;
