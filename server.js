@@ -1724,16 +1724,65 @@ app.post(
     const { caseId, stepId } = req.params;
 
     try {
-      const [optionRows] = await pool.query(
-        `SELECT * FROM case_step_options WHERE id = ? AND stepId = ?`,
-        [selectedOptionId, stepId]
-      );
-      const optionRow = optionRows[0];
+      let isCorrect = false;
+      let feedback = '';
 
-      if (!optionRow)
+      // First check if it's a standard standalone MCQ step option
+      let isStandalone = false;
+      if (!isNaN(selectedOptionId)) {
+        const [optionRows] = await pool.query(
+          `SELECT * FROM case_step_options WHERE id = ? AND stepId = ?`,
+          [selectedOptionId, stepId]
+        );
+        if (optionRows.length > 0) {
+          isStandalone = true;
+          isCorrect = !!optionRows[0].isCorrect;
+          feedback = optionRows[0].feedback;
+        }
+      }
+
+      // If not standalone, check if it's part of a composite_assessment/hub's JSON structure
+      if (!isStandalone) {
+        const [stepRows] = await pool.query(
+          `SELECT type, content FROM case_steps WHERE id = ? AND caseId = ?`,
+          [stepId, caseId]
+        );
+        
+        if (stepRows.length > 0) {
+          const stepData = stepRows[0];
+          let content = stepData.content;
+          if (typeof content === 'string') {
+            try { content = JSON.parse(content); } catch (e) { content = {}; }
+          }
+          
+          if (content && content.sections) {
+            // Find the MCQ section that contains the selected option
+            let foundOption = null;
+            let foundSection = null;
+            
+            for (const sec of content.sections) {
+              if (sec.type === 'mcq' && sec.options) {
+                const opt = sec.options.find(o => String(o.id) === String(selectedOptionId));
+                if (opt) {
+                  foundOption = opt;
+                  foundSection = sec;
+                  break;
+                }
+              }
+            }
+            
+            if (foundOption) {
+              isStandalone = true; // Not strictly standalone, but validation succeeded
+              isCorrect = !!foundOption.isCorrect;
+              feedback = isCorrect ? foundSection.explanationOnSuccess : foundSection.explanationOnFail;
+            }
+          }
+        }
+      }
+
+      if (!isStandalone) {
         return res.status(400).json({ message: 'Invalid option' });
-
-      const isCorrect = !!optionRow.isCorrect;
+      }
 
       // Record the attempt in step_attempts table for performance tracking
       try {
@@ -1744,7 +1793,7 @@ app.post(
             req.user.id,
             caseId,
             stepId,
-            selectedOptionId,
+            String(selectedOptionId), // Allow strings
             isCorrect ? 1 : 0,
             timeSpent || 0,
             hintShown ? 1 : 0,
@@ -1759,7 +1808,7 @@ app.post(
       if (!isCorrect) {
         return res.json({
           correct: false,
-          feedback: optionRow.feedback,
+          feedback: feedback,
         });
       }
 
@@ -1829,10 +1878,40 @@ app.post(
 
     try {
       // Fetch essay questions for this step
-      const [essayQuestions] = await pool.query(
+      let [essayQuestions] = await pool.query(
         `SELECT * FROM essay_questions WHERE step_id = ?`,
         [stepId]
       );
+
+      // If not standalone, check if it's part of a composite_assessment/hub's JSON structure
+      if (essayQuestions.length === 0) {
+        const [stepRows] = await pool.query(
+          `SELECT type, content FROM case_steps WHERE id = ? AND caseId = ?`,
+          [stepId, caseId]
+        );
+        
+        if (stepRows.length > 0) {
+          const stepData = stepRows[0];
+          let content = stepData.content;
+          if (typeof content === 'string') {
+            try { content = JSON.parse(content); } catch (e) { content = {}; }
+          }
+          
+          if (content && content.sections) {
+            const essaySections = content.sections.filter(s => s.type === 'essay');
+            if (essaySections.length > 0) {
+              // Map the JSON structure to match the SQL table format expected by the scoring algorithm
+              essayQuestions = essaySections.map(sec => ({
+                question_text: sec.question || '',
+                keywords: JSON.stringify(sec.expectedKeywords || []),
+                synonyms: '[]',
+                perfect_answer: sec.perfectAnswer || '',
+                max_score: 10
+              }));
+            }
+          }
+        }
+      }
 
       if (essayQuestions.length === 0) {
         return res.status(400).json({ message: 'No essay questions found for this step' });
