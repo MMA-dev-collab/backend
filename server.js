@@ -1579,6 +1579,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       id: s.id,
       stepIndex: s.stepIndex,
       type: s.type,
+      title: s.title || null,
       phase: s.phase,
       category: s.category,
       input_mode: s.input_mode,
@@ -1682,6 +1683,14 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
     );
     const progress = progressRows[0];
 
+    // Parse patientData for persistent patient card
+    let patientData = null;
+    try {
+      patientData = caseRow.patientData ? (typeof caseRow.patientData === 'string' ? JSON.parse(caseRow.patientData) : caseRow.patientData) : null;
+    } catch (e) {
+      console.warn(`Failed to parse patientData for case ${caseRow.id}:`, e.message);
+    }
+
     res.json({
       id: caseRow.id,
       title: caseRow.title,
@@ -1691,11 +1700,13 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       metadata: caseRow.metadata
         ? JSON.parse(caseRow.metadata)
         : {},
+      patientData,
       thumbnailUrl: caseRow.thumbnailUrl,
       duration: caseRow.duration || 10,
       isCompleted: !!progress?.isCompleted,
       userScore: progress?.score,
       userProgress: latestAttempts,
+      currentStepIndex: progress?.currentStepIndex || 0,
       steps: stepsDto,
     });
 
@@ -2036,6 +2047,28 @@ app.post(
   }
 );
 
+// Save step progress for mid-case resume
+app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
+  const { caseId } = req.params;
+  const { currentStepIndex } = req.body;
+
+  if (currentStepIndex === undefined || currentStepIndex === null) {
+    return res.status(400).json({ message: 'currentStepIndex is required' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO progress (userId, caseId, currentStepIndex, isCompleted, score, createdAt)
+       VALUES (?, ?, ?, 0, 0, NOW())
+       ON DUPLICATE KEY UPDATE currentStepIndex = VALUES(currentStepIndex)`,
+      [req.user.id, caseId, currentStepIndex]
+    );
+    res.json({ message: 'Progress saved', currentStepIndex });
+  } catch (err) {
+    console.error('Progress save error:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
 
 app.get('/api/stats/me', authMiddleware(), async (req, res) => {
   try {
@@ -2109,6 +2142,13 @@ app.get('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
     if (!row) return res.status(404).json({ message: 'Case not found' });
 
+    let patientData = null;
+    try {
+      patientData = row.patientData ? (typeof row.patientData === 'string' ? JSON.parse(row.patientData) : row.patientData) : null;
+    } catch (e) {
+      console.warn(`Failed to parse patientData for case ${row.id}:`, e.message);
+    }
+
     const caseData = {
       id: row.id,
       title: row.title,
@@ -2120,6 +2160,7 @@ app.get('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       isLocked: !!row.isLocked,
       prerequisiteCaseId: row.prerequisiteCaseId,
       metadata: row.metadata ? JSON.parse(row.metadata) : {},
+      patientData,
       thumbnailUrl: row.thumbnailUrl,
       duration: row.duration || 10,
       requiredPlanId: row.requiredPlanId,
@@ -2134,14 +2175,14 @@ app.get('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 });
 
 app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
-  const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration } =
+  const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, patientData, thumbnailUrl, duration } =
     req.body;
   if (!title) return res.status(400).json({ message: 'Title is required' });
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration, requiredPlanId, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, patientData, thumbnailUrl, duration, requiredPlanId, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
       [
         title,
         specialty || null,
@@ -2151,6 +2192,7 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
         isLocked ? 1 : 0,
         prerequisiteCaseId || null,
         metadata ? JSON.stringify(metadata) : null,
+        patientData ? JSON.stringify(patientData) : null,
         thumbnailUrl || null,
         duration || 10,
         req.body.requiredPlanId || null
@@ -2262,6 +2304,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       }
     }
 
+    const patientData = req.body.patientData;
     const params = [
       title,
       specialty || null,
@@ -2271,6 +2314,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       isLocked ? 1 : 0,
       prerequisiteCaseId || null,
       metadata ? JSON.stringify(metadata) : null,
+      patientData ? JSON.stringify(patientData) : null,
       thumbnailUrl || null,
       duration || 10,
       req.body.requiredPlanId === undefined ? null : req.body.requiredPlanId,
@@ -2280,7 +2324,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
     await pool.query(
       `UPDATE cases
-       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?, status = ?
+       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, patientData = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?, status = ?
        WHERE id = ?`,
       params
     );
@@ -2388,12 +2432,12 @@ app.get('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) 
 // POST new step
 app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
+  const { stepIndex, type, title, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO case_steps (caseId, stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, hint_text, tag, expected_time, hint_enabled, logic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, stepIndex, type, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null]
+      `INSERT INTO case_steps (caseId, stepIndex, type, title, phase, category, input_mode, content, question, explanationOnFail, maxScore, hint_text, tag, expected_time, hint_enabled, logic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, stepIndex, type, title || null, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null]
     );
     const stepId = result.insertId;
 
@@ -2447,12 +2491,12 @@ app.post('/api/admin/cases/:id/steps', authMiddleware('admin'), async (req, res)
 // PUT update step
 app.put('/api/admin/steps/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
-  const { stepIndex, type, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
+  const { stepIndex, type, title, phase, category, input_mode, content, question, explanationOnFail, maxScore, options, investigations, xrays, essayQuestions, hint_text, tag, expected_time, hint_enabled, logic } = req.body;
 
   try {
     await pool.query(
-      `UPDATE case_steps SET stepIndex=?, type=?, phase=?, category=?, input_mode=?, content=?, question=?, explanationOnFail=?, maxScore=?, hint_text=?, tag=?, expected_time=?, hint_enabled=?, logic=? WHERE id=?`,
-      [stepIndex, type, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null, id]
+      `UPDATE case_steps SET stepIndex=?, type=?, title=?, phase=?, category=?, input_mode=?, content=?, question=?, explanationOnFail=?, maxScore=?, hint_text=?, tag=?, expected_time=?, hint_enabled=?, logic=? WHERE id=?`,
+      [stepIndex, type, title || null, phase || null, category || null, input_mode || 'author_only', JSON.stringify(content), question, explanationOnFail, maxScore, hint_text || null, tag || null, expected_time || null, hint_enabled !== undefined ? (hint_enabled ? 1 : 0) : 1, logic ? JSON.stringify(logic) : null, id]
     );
 
     // Clean up related data to overwrite
