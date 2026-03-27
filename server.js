@@ -2305,6 +2305,13 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
+    // Fetch existing case to prevent overwriting missing fields with null
+    const [existingCaseRows] = await pool.query(`SELECT * FROM cases WHERE id = ?`, [id]);
+    if (existingCaseRows.length === 0) {
+      return res.status(404).json({ message: 'Case not found' });
+    }
+    const existingCase = existingCaseRows[0];
+
     // Step Count Validation for Publication
     if (status === 'published') {
       const [stepRows] = await pool.query(
@@ -2317,8 +2324,9 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
         });
       }
     }
+    // ... [Plan validation code remains unchanged] ...
     // Validate requiredPlanId if provided
-    if (req.body.requiredPlanId) {
+    if (req.body.requiredPlanId !== undefined && req.body.requiredPlanId !== null) {
       const [planRows] = await pool.query(
         `SELECT isActive FROM subscription_plans WHERE id = ?`,
         [req.body.requiredPlanId]
@@ -2358,8 +2366,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
     } else if (status === 'published') {
       // If status is published but requiredPlanId is NOT provided in body, 
       // check the existing plan assigned to this case
-      const [caseRows] = await pool.query(`SELECT requiredPlanId FROM cases WHERE id = ?`, [id]);
-      const currentPlanId = caseRows[0]?.requiredPlanId;
+      const currentPlanId = existingCase.requiredPlanId;
 
       if (currentPlanId) {
         const [planInfo] = await pool.query(
@@ -2383,21 +2390,30 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       }
     }
 
-    const patientData = req.body.patientData;
+    const parseData = (data) => {
+      try {
+        return data ? (typeof data === 'string' ? JSON.parse(data) : data) : null;
+      } catch (e) {
+        return null;
+      }
+    };
+    const mergedPatientData = req.body.patientData !== undefined ? req.body.patientData : parseData(existingCase.patientData);
+    const mergedMetadata = metadata !== undefined ? metadata : parseData(existingCase.metadata);
+
     const params = [
-      title,
-      specialty || null,
-      category || null,
-      categoryId || null,
-      difficulty || null,
-      isLocked ? 1 : 0,
-      prerequisiteCaseId || null,
-      metadata ? JSON.stringify(metadata) : null,
-      patientData ? JSON.stringify(patientData) : null,
-      thumbnailUrl || null,
-      duration || 10,
-      req.body.requiredPlanId === undefined ? null : req.body.requiredPlanId,
-      status || 'draft',
+      title !== undefined ? title : existingCase.title,
+      specialty !== undefined ? specialty : existingCase.specialty,
+      category !== undefined ? category : existingCase.category,
+      categoryId !== undefined ? categoryId : existingCase.categoryId,
+      difficulty !== undefined ? difficulty : existingCase.difficulty,
+      isLocked !== undefined ? (isLocked ? 1 : 0) : existingCase.isLocked,
+      prerequisiteCaseId !== undefined ? prerequisiteCaseId : existingCase.prerequisiteCaseId,
+      mergedMetadata ? JSON.stringify(mergedMetadata) : null,
+      mergedPatientData ? JSON.stringify(mergedPatientData) : null,
+      thumbnailUrl !== undefined ? thumbnailUrl : existingCase.thumbnailUrl,
+      duration !== undefined ? duration : existingCase.duration,
+      req.body.requiredPlanId !== undefined ? req.body.requiredPlanId : existingCase.requiredPlanId,
+      status !== undefined ? status : existingCase.status,
       id,
     ];
 
