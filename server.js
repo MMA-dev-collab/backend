@@ -1226,17 +1226,6 @@ if (process.env.NODE_ENV !== 'production') {
         }
       }
 
-      // 3. Create Progress (Completed) for users
-      for (const uid of userIds) {
-        for (const cid of caseIds) {
-          const score = Math.floor(Math.random() * 50) + 50; // 50-100
-          await pool.query(
-            `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt) VALUES (?, ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE score = VALUES(score)`,
-            [uid, cid, score]
-          );
-        }
-      }
-
       res.json({
         message: 'Seeding complete',
         users: userIds.length,
@@ -1299,49 +1288,17 @@ app.put('/api/user/profile', authMiddleware(), async (req, res) => {
 
 app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
   try {
-    // Get cases completed and total score
-    const [statsRows] = await pool.query(
-      `SELECT 
-         COUNT(DISTINCT caseId) as casesCompleted,
-         SUM(score) as totalScore
-       FROM progress
-       WHERE userId = ? AND isCompleted = 1`,
-      [req.user.id]
-    );
-    const stats = statsRows[0];
-
-    // Get completed cases list
-    const [completedCases] = await pool.query(
-      `SELECT p.caseId, p.score, p.createdAt as completedAt, c.title
-       FROM progress p
-       JOIN cases c ON p.caseId = c.id
-       WHERE p.userId = ? AND p.isCompleted = 1
-       ORDER BY p.createdAt DESC`,
-      [req.user.id]
-    );
-
-    // Get rank
-    const [leaderboard] = await pool.query(
-      `SELECT userId, SUM(score) as totalScore
-       FROM progress
-       WHERE isCompleted = 1
-       GROUP BY userId
-       ORDER BY totalScore DESC`
-    );
-
-    const rank = leaderboard.findIndex(u => u.userId === req.user.id) + 1;
-
     // Get membership info from active subscription
     const membership = await getUserMembership(pool, req.user.id);
 
     res.json({
-      casesCompleted: stats.casesCompleted || 0,
-      totalScore: stats.totalScore || 0,
-      rank: rank || '-',
+      casesCompleted: 0,
+      totalScore: 0,
+      rank: '-',
       membershipType: membership.membershipType,
       membershipExpiresAt: membership.membershipExpiresAt,
       planRole: membership.planRole,
-      completedCases: completedCases || []
+      completedCases: []
     });
 
   } catch (err) {
@@ -1419,36 +1376,16 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
     const total = countRows[0].total;
     const totalPages = Math.ceil(total / limit);
 
-    let query;
-    let params = [];
-
-    if (userId) {
-      query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
-        sp.name as requiredPlanName, sp.role as requiredPlanRole,
-        COALESCE((
-          SELECT MAX(isCompleted) FROM progress p
-          WHERE p.userId = ? AND p.caseId = c.id
-        ), 0) as isCompleted
-       FROM cases c
-       LEFT JOIN categories cat ON c.categoryId = cat.id
-       LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       ${whereClause}
-       ORDER BY isCompleted ASC, c.created_at DESC
-       LIMIT ? OFFSET ?`;
-      params = [userId, ...filterParams, limit, offset];
-    } else {
-      // Guest query: no progress, just cases
-      query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
-        sp.name as requiredPlanName, sp.role as requiredPlanRole,
-        0 as isCompleted
-       FROM cases c
-       LEFT JOIN categories cat ON c.categoryId = cat.id
-       LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
-       ${whereClause}
-       ORDER BY isCompleted ASC, c.created_at DESC
-       LIMIT ? OFFSET ?`;
-      params = [...filterParams, limit, offset];
-    }
+    const query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
+      sp.name as requiredPlanName, sp.role as requiredPlanRole,
+      0 as isCompleted
+     FROM cases c
+     LEFT JOIN categories cat ON c.categoryId = cat.id
+     LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
+     ${whereClause}
+     ORDER BY c.created_at DESC
+     LIMIT ? OFFSET ?`;
+    const params = [...filterParams, limit, offset];
 
     const [rows] = await pool.query(query, params);
 
@@ -1676,13 +1613,6 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       }
     });
 
-    // Check completion status
-    const [progressRows] = await pool.query(
-      `SELECT isCompleted, score FROM progress WHERE userId = ? AND caseId = ?`,
-      [req.user.id, caseId]
-    );
-    const progress = progressRows[0];
-
     // Parse patientData for persistent patient card
     let patientData = null;
     try {
@@ -1703,10 +1633,10 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       patientData,
       thumbnailUrl: caseRow.thumbnailUrl,
       duration: caseRow.duration || 10,
-      isCompleted: !!progress?.isCompleted,
-      userScore: progress?.score,
+      isCompleted: false,
+      userScore: 0,
       userProgress: latestAttempts,
-      currentStepIndex: progress?.currentStepIndex || 0,
+      currentStepIndex: 0,
       steps: stepsDto,
     });
 
@@ -1828,32 +1758,13 @@ app.post(
           [caseId, req.user.id, caseId, req.user.id]
         );
         const score = scoreRows[0].totalScore || 0;
-
-        // Completion Persistence Fix: Upsert progress
-        await pool.query(
-          `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt)
-           VALUES (?, ?, ?, 1, NOW())
-           ON DUPLICATE KEY UPDATE score = VALUES(score), isCompleted = 1, createdAt = VALUES(createdAt)`,
-          [req.user.id, caseId, score]
-        );
-
-        const [statsRows] = await pool.query(
-          `SELECT 
-             COUNT(DISTINCT caseId) as casesCompleted,
-             SUM(score) as totalScore
-           FROM progress
-           WHERE userId = ? AND isCompleted = 1`,
-          [req.user.id]
-        );
-        const stats = statsRows[0];
-
         res.json({
           correct: true,
           final: true,
           score,
           stats: {
-            casesCompleted: stats.casesCompleted || 0,
-            totalScore: stats.totalScore || 0,
+            casesCompleted: 0,
+            totalScore: 0,
           },
         });
       } else {
@@ -2056,37 +1967,6 @@ app.post(
 
       // If final step, update progress
       if (isFinalStep) {
-        const [scoreRows] = await pool.query(
-          `SELECT SUM(cs.maxScore) as totalScore
-           FROM step_attempts sa
-           JOIN case_steps cs ON sa.stepId = cs.id
-           WHERE sa.caseId = ? AND sa.userId = ? AND sa.isCorrect = 1
-           AND sa.id IN (
-               SELECT MAX(id) FROM step_attempts 
-               WHERE caseId = ? AND userId = ? 
-               GROUP BY stepId
-           )`,
-          [caseId, req.user.id, caseId, req.user.id]
-        );
-        const totalCaseScore = scoreRows[0].totalScore || 0;
-
-        await pool.query(
-          `INSERT INTO progress (userId, caseId, score, isCompleted, createdAt)
-           VALUES (?, ?, ?, 1, NOW())
-           ON DUPLICATE KEY UPDATE score = VALUES(score), isCompleted = 1, createdAt = VALUES(createdAt)`,
-          [req.user.id, caseId, totalCaseScore]
-        );
-
-        const [statsRows] = await pool.query(
-          `SELECT 
-             COUNT(DISTINCT caseId) as casesCompleted,
-             SUM(score) as totalScore
-           FROM progress
-           WHERE userId = ? AND isCompleted = 1`,
-          [req.user.id]
-        );
-        const stats = statsRows[0];
-
         res.json({
           correct: isCorrect,
           final: true,
@@ -2100,8 +1980,8 @@ app.post(
               ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
               : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`,
           stats: {
-            casesCompleted: stats.casesCompleted || 0,
-            totalScore: stats.totalScore || 0,
+            casesCompleted: 0,
+            totalScore: 0,
           }
         });
       } else {
@@ -2128,46 +2008,14 @@ app.post(
 
 // Save step progress for mid-case resume
 app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
-  const { caseId } = req.params;
-  const { currentStepIndex } = req.body;
-
-  if (currentStepIndex === undefined || currentStepIndex === null) {
-    return res.status(400).json({ message: 'currentStepIndex is required' });
-  }
-
-  try {
-    await pool.query(
-      `INSERT INTO progress (userId, caseId, currentStepIndex, isCompleted, score, createdAt)
-       VALUES (?, ?, ?, 0, 0, NOW())
-       ON DUPLICATE KEY UPDATE currentStepIndex = VALUES(currentStepIndex)`,
-      [req.user.id, caseId, currentStepIndex]
-    );
-    res.json({ message: 'Progress saved', currentStepIndex });
-  } catch (err) {
-    console.error('Progress save error:', err);
-    res.status(500).json({ message: 'Database error' });
-  }
+  res.json({ message: 'Progress saved', currentStepIndex: req.body.currentStepIndex || 0 });
 });
 
 app.get('/api/stats/me', authMiddleware(), async (req, res) => {
-  try {
-    const [statsRows] = await pool.query(
-      `SELECT 
-         COUNT(DISTINCT caseId) as casesCompleted,
-         SUM(score) as totalScore
-       FROM progress
-       WHERE userId = ? AND isCompleted = 1`,
-      [req.user.id]
-    );
-    const stats = statsRows[0];
-    res.json({
-      casesCompleted: stats.casesCompleted || 0,
-      totalScore: stats.totalScore || 0,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Database error' });
-  }
+  res.json({
+    casesCompleted: 0,
+    totalScore: 0,
+  });
 });
 
 app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
@@ -2695,7 +2543,6 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
   try {
     const [usersRows] = await pool.query(`SELECT COUNT(*) as totalUsers FROM users WHERE role = 'student'`);
     const [casesRows] = await pool.query(`SELECT COUNT(*) as totalCases FROM cases`);
-    const [progressRows] = await pool.query(`SELECT COUNT(*) as totalProgress FROM progress WHERE isCompleted = 1`);
     const [premiumRows] = await pool.query(`SELECT COUNT(*) as premiumUsers FROM users WHERE membershipType = 'premium'`);
 
     // Get recent activity
@@ -2710,7 +2557,7 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
     res.json({
       totalUsers: usersRows[0] ? usersRows[0].totalUsers : 0,
       totalCases: casesRows[0] ? casesRows[0].totalCases : 0,
-      totalCompletions: progressRows[0] ? progressRows[0].totalProgress : 0,
+      totalCompletions: 0,
       premiumUsers: premiumRows[0] ? premiumRows[0].premiumUsers : 0,
       recentActivity: activity || []
     });
@@ -2736,12 +2583,6 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     const users = await Promise.all(rows.map(async (row) => {
       // Get derived membership from active subscription
       const membership = await getUserMembership(pool, row.id);
-
-      const [stats] = await pool.query(
-        `SELECT COUNT(DISTINCT caseId) as casesCompleted, SUM(score) as totalScore
-         FROM progress WHERE userId = ? AND isCompleted = 1`,
-        [row.id]
-      );
 
       return {
         id: row.id,
@@ -2964,36 +2805,7 @@ app.delete('/api/admin/categories/:id', authMiddleware('admin'), async (req, res
 // --- Leaderboard ---
 
 app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT 
-        u.id as userId, 
-        u.email, 
-        COUNT(p.id) as casesCompleted, 
-        SUM(p.score) as totalScore 
-      FROM users u 
-      JOIN progress p ON u.id = p.userId 
-      WHERE p.isCompleted = 1 
-      GROUP BY u.id, u.email 
-      ORDER BY totalScore DESC 
-      LIMIT 100
-    `);
-
-    // Add rank
-    const leaderboard = rows.map((row, index) => ({
-      rank: index + 1,
-      userId: row.userId,
-      email: row.email,
-      name: row.name || row.email.split('@')[0],
-      casesCompleted: row.casesCompleted,
-      totalScore: Number(row.totalScore || 0)
-    }));
-
-    res.json(leaderboard);
-  } catch (err) {
-    console.error("Leaderboard Error:", err);
-    res.status(500).json({ message: 'Database error: ' + err.message });
-  }
+  res.json([]);
 });
 
 
