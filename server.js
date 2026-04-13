@@ -1593,7 +1593,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
 
     // Load attempts if user is logged in
     const [attempts] = await pool.query(
-      `SELECT stepId, selectedOptionId, isCorrect, attemptNumber, essay_answer 
+      `SELECT stepId, selectedOptionId, isCorrect, attemptNumber, essay_answer, answer_data, score 
        FROM step_attempts 
        WHERE caseId = ? AND userId = ?
        ORDER BY attemptNumber DESC`, // Get latest attempts
@@ -1605,10 +1605,15 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
     attempts.forEach(a => {
       // Since we ordered by DESC, the first one we see is the latest
       if (!latestAttempts[a.stepId]) {
+        let parsedAnswerData = null;
+        try { if (a.answer_data) parsedAnswerData = typeof a.answer_data === 'string' ? JSON.parse(a.answer_data) : a.answer_data; } catch(e) {}
+        
         latestAttempts[a.stepId] = {
           selectedOptionId: a.selectedOptionId,
           isCorrect: !!a.isCorrect,
-          essay_answer: a.essay_answer
+          essay_answer: a.essay_answer,
+          answer_data: parsedAnswerData,
+          score: a.score
         };
       }
     });
@@ -1619,6 +1624,31 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       patientData = caseRow.patientData ? (typeof caseRow.patientData === 'string' ? JSON.parse(caseRow.patientData) : caseRow.patientData) : null;
     } catch (e) {
       console.warn(`Failed to parse patientData for case ${caseRow.id}:`, e.message);
+    }
+
+    // Fetch user progress
+    let isCompleted = false;
+    let currentStepIndex = 0;
+    let maxReachedIndex = 0;
+    let activeSubStepId = null;
+    let completedSubSteps = [];
+    let hubProgress = {};
+
+    if (req.user && req.user.id) {
+      const [progRows] = await pool.query(
+        `SELECT * FROM user_case_progress WHERE userId = ? AND caseId = ?`,
+        [req.user.id, caseId]
+      );
+      if (progRows.length > 0) {
+        const p = progRows[0];
+        isCompleted = !!p.isCompleted;
+        currentStepIndex = p.currentStepIndex || 0;
+        maxReachedIndex = p.maxReachedIndex || 0;
+        activeSubStepId = p.activeSubStepId;
+        
+        try { completedSubSteps = p.completedSubSteps ? (typeof p.completedSubSteps === 'string' ? JSON.parse(p.completedSubSteps) : p.completedSubSteps) : []; } catch(e){}
+        try { hubProgress = p.hubProgress ? (typeof p.hubProgress === 'string' ? JSON.parse(p.hubProgress) : p.hubProgress) : {}; } catch(e){}
+      }
     }
 
     res.json({
@@ -1633,16 +1663,113 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       patientData,
       thumbnailUrl: caseRow.thumbnailUrl,
       duration: caseRow.duration || 10,
-      isCompleted: false,
+      isCompleted,
+      maxReachedIndex,
+      activeSubStepId,
+      completedSubSteps,
+      hubProgress,
       userScore: 0,
       userProgress: latestAttempts,
-      currentStepIndex: 0,
+      currentStepIndex,
       steps: stepsDto,
     });
 
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Update case progress
+app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
+  const { caseId } = req.params;
+  const { currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex } = req.body;
+  const userId = req.user.id;
+
+  try {
+    await pool.query(
+      `INSERT INTO user_case_progress (userId, caseId, currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+         currentStepIndex = VALUES(currentStepIndex),
+         activeSubStepId = VALUES(activeSubStepId),
+         completedSubSteps = VALUES(completedSubSteps),
+         hubProgress = VALUES(hubProgress),
+         maxReachedIndex = GREATEST(maxReachedIndex, VALUES(maxReachedIndex))`,
+      [
+        userId, 
+        caseId, 
+        currentStepIndex || 0,
+        activeSubStepId || null,
+        completedSubSteps ? JSON.stringify(completedSubSteps) : null,
+        hubProgress ? JSON.stringify(hubProgress) : null,
+        maxReachedIndex || 0
+      ]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error saving progress:', err);
+    res.status(500).json({ message: 'Failed to save progress' });
+  }
+});
+
+// Complete case
+app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
+  const { caseId } = req.params;
+  const userId = req.user.id;
+
+  try {
+    // 1. Calculate score based on user's attempts in step_attempts
+    const [attempts] = await pool.query(
+      `SELECT stepId, isCorrect FROM step_attempts 
+       WHERE caseId = ? AND userId = ?`, 
+      [caseId, userId]
+    );
+
+    // Get max scores for the case
+    const [steps] = await pool.query(
+      `SELECT id, type, maxScore, content FROM case_steps WHERE caseId = ?`,
+      [caseId]
+    );
+
+    let totalScore = 0;
+    let maxPossibleScore = 0;
+
+    const CORRECT_ATTEMPTS = new Set();
+    attempts.forEach(a => {
+      if (a.isCorrect) CORRECT_ATTEMPTS.add(a.stepId);
+    });
+
+    for (const step of steps) {
+      if (step.type === 'mcq' || step.type === 'essay' || step.type === 'clinical') {
+        maxPossibleScore += (step.maxScore || 10);
+        if (CORRECT_ATTEMPTS.has(step.id)) {
+           totalScore += (step.maxScore || 10);
+        }
+      }
+    }
+
+    // 2. Mark as completed
+    await pool.query(
+      `INSERT INTO user_case_progress (userId, caseId, isCompleted, completedAt, totalScore)
+       VALUES (?, ?, 1, NOW(), ?)
+       ON DUPLICATE KEY UPDATE 
+         isCompleted = 1,
+         completedAt = NOW(),
+         totalScore = ?`,
+      [userId, caseId, totalScore, totalScore]
+    );
+
+    res.json({
+      success: true,
+      score: totalScore,
+      maxPossibleScore,
+      completedAt: new Date()
+    });
+  } catch (err) {
+    console.error('Error completing case:', err);
+    res.status(500).json({ message: 'Failed to complete case' });
   }
 });
 
@@ -1716,18 +1843,24 @@ app.post(
 
       // Record the attempt in step_attempts table for performance tracking
       try {
+        const mcqAnswerData = {
+          selectedOptionId,
+          isCorrect,
+          feedback: feedback || null
+        };
         await pool.query(
-          `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, answer_data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.id,
             caseId,
             stepId,
-            String(selectedOptionId), // Allow strings
+            isNaN(selectedOptionId) ? null : Number(selectedOptionId), // Null if string like 'a' for composite options
             isCorrect ? 1 : 0,
             timeSpent || 0,
             hintShown ? 1 : 0,
-            attemptNumber || 1
+            attemptNumber || 1,
+            JSON.stringify(mcqAnswerData)
           ]
         );
       } catch (attemptErr) {
@@ -1784,7 +1917,7 @@ app.post(
   '/api/cases/:caseId/steps/:stepId/answer-essay',
   authMiddleware(),
   async (req, res) => {
-    const { essayAnswer, isFinalStep, timeSpent, hintShown, attemptNumber } = req.body;
+    const { essayAnswer, isFinalStep, timeSpent, hintShown, attemptNumber, structuredAnswer, problemListItems } = req.body;
     const { caseId, stepId } = req.params;
 
     try {
@@ -1947,11 +2080,49 @@ app.post(
       const finalScore = Math.min(totalScore, stepMaxScore);
       const isCorrect = finalScore >= (stepMaxScore * 0.6); // 60% threshold
 
+      // Build feedback text (same logic used in the response below)
+      const feedbackText = isPerfectMatch
+        ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
+        : isCorrect
+          ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+          : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`;
+
+      // Preserve complex payload as answer_data
+      let answerData = {};
+      if (structuredAnswer) answerData.structuredAnswer = structuredAnswer;
+      if (problemListItems) answerData.problemListItems = problemListItems;
+      if (essayAnswer) answerData.essayAnswer = essayAnswer;
+      answerData.feedback = feedbackText;
+      answerData.essayScore = finalScore;
+
+      // For composite steps: merge any existing MCQ attempt data so both MCQ+Essay survive
+      try {
+        const [existingAttempts] = await pool.query(
+          `SELECT answer_data FROM step_attempts 
+           WHERE userId = ? AND caseId = ? AND stepId = ? AND selectedOptionId IS NOT NULL
+           ORDER BY id DESC LIMIT 1`,
+          [req.user.id, caseId, stepId]
+        );
+        if (existingAttempts.length > 0 && existingAttempts[0].answer_data) {
+          try {
+            const mcqData = typeof existingAttempts[0].answer_data === 'string' 
+              ? JSON.parse(existingAttempts[0].answer_data) 
+              : existingAttempts[0].answer_data;
+            // Merge MCQ fields into answerData (essay fields take priority)
+            if (mcqData.selectedOptionId !== undefined) answerData.selectedOptionId = mcqData.selectedOptionId;
+            if (mcqData.isCorrect !== undefined) answerData.mcqIsCorrect = mcqData.isCorrect;
+            if (mcqData.feedback) answerData.mcqFeedback = mcqData.feedback;
+          } catch (parseErr) { /* ignore parse errors */ }
+        }
+      } catch (mergeErr) {
+        console.error('Failed to merge MCQ data for composite step:', mergeErr);
+      }
+
       // Record the attempt
       await pool.query(
         `INSERT INTO step_attempts 
-         (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords)
-         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+         (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           req.user.id,
           caseId,
@@ -1961,7 +2132,9 @@ app.post(
           hintShown ? 1 : 0,
           attemptNumber || 1,
           essayAnswer,
-          JSON.stringify(allMatchedKeywords)
+          JSON.stringify(allMatchedKeywords),
+          Object.keys(answerData).length > 0 ? JSON.stringify(answerData) : null,
+          finalScore
         ]
       );
 
