@@ -2064,7 +2064,7 @@ app.post(
         // Calculate score for this question
         const questionScore = keywords.length > 0
           ? (matchedKeywords.length / keywords.length) * (eq.max_score || 10)
-          : 0;
+          : (eq.max_score || 10); // Award full marks if no keywords defined
 
         totalScore += questionScore;
       }
@@ -2083,9 +2083,11 @@ app.post(
       // Build feedback text (same logic used in the response below)
       const feedbackText = isPerfectMatch
         ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
-        : isCorrect
-          ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
-          : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`;
+        : (totalKeywords === 0)
+          ? `Answer recorded successfully.`
+          : isCorrect
+            ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+            : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`;
 
       // Preserve complex payload as answer_data
       let answerData = {};
@@ -2149,9 +2151,11 @@ app.post(
           totalKeywords: totalKeywords,
           feedback: isPerfectMatch
             ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
-            : isCorrect
-              ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
-              : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`,
+            : (totalKeywords === 0)
+              ? `Answer recorded successfully.`
+              : isCorrect
+                ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+                : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`,
           stats: {
             casesCompleted: 0,
             totalScore: 0,
@@ -2166,14 +2170,56 @@ app.post(
           totalKeywords: totalKeywords,
           feedback: isPerfectMatch
             ? `🎉 Perfect! Your answer matches the model answer. Excellent work!`
-            : isCorrect
-              ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
-              : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`
+            : (totalKeywords === 0)
+              ? `Answer recorded successfully.`
+              : isCorrect
+                ? `Great job! You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts.`
+                : `You matched ${allMatchedKeywords.length} out of ${totalKeywords} key concepts. Review the material and try to include more relevant terms.`
         });
       }
 
     } catch (err) {
       console.error('Essay answer error:', err);
+      res.status(500).json({ message: 'Database error' });
+    }
+  }
+);
+
+// Structural Answer Submission Endpoint (Problem List & Diagnosis)
+app.post(
+  '/api/cases/:caseId/steps/:stepId/answer-structural',
+  authMiddleware(),
+  async (req, res) => {
+    const { essayAnswer, problemListItems, structuredAnswer, evalScore, evalFeedback, evalResult, isFinalStep, timeSpent, hintShown, attemptNumber } = req.body;
+    const { caseId, stepId } = req.params;
+
+    try {
+      let answerData = {
+        essayAnswer,
+        problemListItems,
+        structuredAnswer,
+        evalResult,
+        essayScore: evalScore || 0,
+        feedback: evalFeedback || 'Answer recorded successfully.'
+      };
+
+      const [stepRows] = await pool.query(`SELECT maxScore FROM case_steps WHERE id = ?`, [stepId]);
+      const stepMaxScore = stepRows[0]?.maxScore || 10;
+      const finalScore = evalScore || 0;
+      const isCorrect = finalScore >= (stepMaxScore * 0.6);
+
+      await pool.query(
+        `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.id, caseId, stepId, isCorrect ? 1 : 0, timeSpent || 0, hintShown ? 1 : 0, attemptNumber || 1, essayAnswer, '[]', JSON.stringify(answerData), finalScore]
+      );
+
+      if (isFinalStep) {
+        res.json({ correct: isCorrect, final: true, score: finalScore, maxScore: stepMaxScore, feedback: answerData.feedback, stats: { casesCompleted: 0, totalScore: 0 } });
+      } else {
+        res.json({ correct: isCorrect, score: finalScore, maxScore: stepMaxScore, feedback: answerData.feedback });
+      }
+    } catch (err) {
+      console.error('Structural answer error:', err);
       res.status(500).json({ message: 'Database error' });
     }
   }
