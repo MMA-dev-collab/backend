@@ -1288,17 +1288,58 @@ app.put('/api/user/profile', authMiddleware(), async (req, res) => {
 
 app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
   try {
+    const userId = req.user.id;
+
     // Get membership info from active subscription
-    const membership = await getUserMembership(pool, req.user.id);
+    const membership = await getUserMembership(pool, userId);
+
+    const [statsRows] = await pool.query(
+      `SELECT 
+        SUM(CASE WHEN isCompleted = 1 OR completedAt IS NOT NULL THEN 1 ELSE 0 END) as casesCompleted,
+        SUM(totalScore) as totalScore
+       FROM user_case_progress
+       WHERE userId = ? AND (isCompleted = 1 OR completedAt IS NOT NULL)`,
+       [userId]
+    );
+    
+    const [completedCasesRows] = await pool.query(
+      `SELECT ucp.caseId, c.title, ucp.completedAt, ucp.totalScore as score
+       FROM user_case_progress ucp
+       JOIN cases c ON ucp.caseId = c.id
+       WHERE ucp.userId = ? AND (ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL)
+       ORDER BY ucp.completedAt DESC`,
+       [userId]
+    );
+
+    const currentTotalScore = Number(statsRows[0]?.totalScore || 0);
+    const currentCasesCompleted = Number(statsRows[0]?.casesCompleted || 0);
+
+    const [rankRows] = await pool.query(
+      `SELECT COUNT(*) as rankCount 
+       FROM (
+         SELECT userId, SUM(totalScore) as s_score, SUM(CASE WHEN isCompleted = 1 OR completedAt IS NOT NULL THEN 1 ELSE 0 END) as s_cases
+         FROM user_case_progress
+         GROUP BY userId
+         HAVING s_cases > 0
+       ) as UserTotals
+       WHERE s_score > ? OR (s_score = ? AND s_cases > ?)`,
+       [currentTotalScore, currentTotalScore, currentCasesCompleted]
+    );
+    let rank = (rankRows[0]?.rankCount || 0) + 1;
 
     res.json({
-      casesCompleted: 0,
-      totalScore: 0,
-      rank: '-',
+      casesCompleted: currentCasesCompleted,
+      totalScore: currentTotalScore,
+      rank,
       membershipType: membership.membershipType,
       membershipExpiresAt: membership.membershipExpiresAt,
       planRole: membership.planRole,
-      completedCases: []
+      completedCases: completedCasesRows.map(c => ({
+        caseId: c.caseId,
+        title: c.title,
+        completedAt: c.completedAt,
+        score: c.score
+      }))
     });
 
   } catch (err) {
@@ -3021,11 +3062,7 @@ app.delete('/api/admin/categories/:id', authMiddleware('admin'), async (req, res
 });
 
 
-// --- Leaderboard ---
-
-app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
-  res.json([]);
-});
+// --- Leaderboard moved to the statistics section ---
 
 
 // ======================
@@ -3646,6 +3683,114 @@ app.get('/api/steps/:stepId/hint', authMiddleware(), async (req, res) => {
 
   } catch (err) {
     console.error('Hint retrieval error:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+/* ======================
+   LEADERBOARD & STATISTICS ROUTES
+====================== */
+
+// Get global leaderboard
+app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT u.id as userId, u.email, 
+              SUM(CASE WHEN ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL THEN 1 ELSE 0 END) as casesCompleted, 
+              SUM(ucp.totalScore) as totalScore
+       FROM users u
+       JOIN user_case_progress ucp ON u.id = ucp.userId
+       GROUP BY u.id, u.email
+       HAVING casesCompleted > 0
+       ORDER BY totalScore DESC, casesCompleted DESC
+       LIMIT 100`
+    );
+
+    const leaderboard = rows.map((r, index) => ({
+      rank: index + 1,
+      userId: r.userId,
+      email: r.email,
+      casesCompleted: Number(r.casesCompleted) || 0,
+      totalScore: Number(r.totalScore) || 0
+    }));
+
+    res.json(leaderboard);
+  } catch (err) {
+    console.error('Leaderboard error:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Get user profile statistics
+app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const [userRows] = await pool.query(
+      `SELECT email, membershipType FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    if (userRows.length === 0) return res.status(404).json({ message: "User not found" });
+
+    const [subRows] = await pool.query(
+      `SELECT endDate FROM subscriptions WHERE userId = ? AND status = 'active' ORDER BY endDate DESC LIMIT 1`,
+      [userId]
+    );
+
+    const [statsRows] = await pool.query(
+      `SELECT 
+        SUM(CASE WHEN isCompleted = 1 THEN 1 ELSE 0 END) as casesCompleted,
+        SUM(totalScore) as totalScore
+       FROM user_case_progress
+       WHERE userId = ? AND isCompleted = 1`,
+       [userId]
+    );
+    
+    const [completedCasesRows] = await pool.query(
+      `SELECT ucp.caseId, c.title, ucp.completedAt, ucp.totalScore as score
+       FROM user_case_progress ucp
+       JOIN cases c ON ucp.caseId = c.id
+       WHERE ucp.userId = ? AND ucp.isCompleted = 1
+       ORDER BY ucp.completedAt DESC`,
+       [userId]
+    );
+
+    const currentTotalScore = Number(statsRows[0]?.totalScore || 0);
+    const currentCasesCompleted = Number(statsRows[0]?.casesCompleted || 0);
+
+    let rank = 1;
+    if (currentCasesCompleted > 0) {
+      const [rankRows] = await pool.query(
+        `SELECT COUNT(*) as rankCount 
+         FROM (
+           SELECT userId, SUM(totalScore) as s_score, SUM(CASE WHEN isCompleted = 1 THEN 1 ELSE 0 END) as s_cases
+           FROM user_case_progress
+           GROUP BY userId
+           HAVING s_cases > 0
+         ) as UserTotals
+         WHERE s_score > ? OR (s_score = ? AND s_cases > ?)`,
+         [currentTotalScore, currentTotalScore, currentCasesCompleted]
+      );
+      rank = (rankRows[0]?.rankCount || 0) + 1;
+    }
+
+    res.json({
+      casesCompleted: currentCasesCompleted,
+      totalScore: currentTotalScore,
+      rank,
+      membershipType: userRows[0].membershipType,
+      membershipExpiresAt: subRows.length > 0 ? subRows[0].endDate : null,
+      completedCases: completedCasesRows.map(c => ({
+        caseId: c.caseId,
+        title: c.title,
+        completedAt: c.completedAt,
+        score: c.score
+      }))
+    });
+
+  } catch (err) {
+    console.error('Profile stats error:', err);
     res.status(500).json({ message: 'Database error' });
   }
 });
