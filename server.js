@@ -1417,16 +1417,22 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
     const total = countRows[0].total;
     const totalPages = Math.ceil(total / limit);
 
+    const isCompletedSelect = userId ? `(SELECT 1 FROM user_case_progress ucp WHERE ucp.caseId = c.id AND ucp.userId = ? AND (ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL) LIMIT 1)` : '0';
+
     const query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
       sp.name as requiredPlanName, sp.role as requiredPlanRole,
-      0 as isCompleted
+      IFNULL(${isCompletedSelect}, 0) as isCompleted
      FROM cases c
      LEFT JOIN categories cat ON c.categoryId = cat.id
      LEFT JOIN subscription_plans sp ON c.requiredPlanId = sp.id
      ${whereClause}
      ORDER BY c.created_at DESC
      LIMIT ? OFFSET ?`;
-    const params = [...filterParams, limit, offset];
+    
+    // params array construction depends on if we used userId
+    const params = userId 
+      ? [userId, ...filterParams, limit, offset] 
+      : [...filterParams, limit, offset];
 
     const [rows] = await pool.query(query, params);
 
@@ -2889,6 +2895,24 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
     res.json(users);
   } catch (err) {
     console.error('Error fetching users [DEBUG_ID_101]:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Update User Role
+app.put('/api/admin/users/:id/role', authMiddleware('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;
+  
+  if (!['admin', 'student', 'instructor', 'user'].includes(role)) {
+    return res.status(400).json({ message: 'Invalid role' });
+  }
+
+  try {
+    await pool.query(`UPDATE users SET role = ? WHERE id = ?`, [role, id]);
+    res.json({ message: 'Role updated successfully' });
+  } catch (err) {
+    console.error('Error updating role:', err);
     res.status(500).json({ message: 'Database error' });
   }
 });
