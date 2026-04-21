@@ -1695,6 +1695,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
         
         try { completedSubSteps = p.completedSubSteps ? (typeof p.completedSubSteps === 'string' ? JSON.parse(p.completedSubSteps) : p.completedSubSteps) : []; } catch(e){}
         try { hubProgress = p.hubProgress ? (typeof p.hubProgress === 'string' ? JSON.parse(p.hubProgress) : p.hubProgress) : {}; } catch(e){}
+        var savedFeedback = p.feedback || '';
       }
     }
 
@@ -1718,6 +1719,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       userScore: 0,
       userProgress: latestAttempts,
       currentStepIndex,
+      feedback: savedFeedback || '',
       steps: stepsDto,
     });
 
@@ -1765,6 +1767,7 @@ app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
 app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
   const { caseId } = req.params;
   const userId = req.user.id;
+  const { feedback } = req.body;
 
   try {
     // 1. Calculate score based on user's attempts in step_attempts
@@ -1797,15 +1800,16 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
       }
     }
 
-    // 2. Mark as completed
+    // 2. Mark as completed (with optional feedback)
     await pool.query(
-      `INSERT INTO user_case_progress (userId, caseId, isCompleted, completedAt, totalScore)
-       VALUES (?, ?, 1, NOW(), ?)
+      `INSERT INTO user_case_progress (userId, caseId, isCompleted, completedAt, totalScore, feedback)
+       VALUES (?, ?, 1, NOW(), ?, ?)
        ON DUPLICATE KEY UPDATE 
          isCompleted = 1,
          completedAt = NOW(),
-         totalScore = ?`,
-      [userId, caseId, totalScore, totalScore]
+         totalScore = ?,
+         feedback = COALESCE(?, feedback)`,
+      [userId, caseId, totalScore, feedback || null, totalScore, feedback || null]
     );
 
     res.json({
@@ -2913,6 +2917,52 @@ app.put('/api/admin/users/:id/role', authMiddleware('admin'), async (req, res) =
     res.json({ message: 'Role updated successfully' });
   } catch (err) {
     console.error('Error updating role:', err);
+    res.status(500).json({ message: 'Database error' });
+  }
+});
+
+// Admin Feedback listing
+app.get('/api/admin/feedback', authMiddleware('admin'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT ucp.id, ucp.userId, ucp.caseId, ucp.feedback, ucp.totalScore, ucp.completedAt,
+              u.name as userName, u.email as userEmail, u.profileImage as userProfileImage,
+              c.title as caseTitle, c.difficulty as caseDifficulty
+       FROM user_case_progress ucp
+       JOIN users u ON ucp.userId = u.id
+       JOIN cases c ON ucp.caseId = c.id
+       WHERE ucp.feedback IS NOT NULL AND ucp.feedback != ''
+       ORDER BY ucp.completedAt DESC`
+    );
+
+    // Group by case
+    const caseMap = {};
+    for (const row of rows) {
+      if (!caseMap[row.caseId]) {
+        caseMap[row.caseId] = {
+          caseId: row.caseId,
+          caseTitle: row.caseTitle,
+          caseDifficulty: row.caseDifficulty,
+          feedbackCount: 0,
+          entries: []
+        };
+      }
+      caseMap[row.caseId].feedbackCount++;
+      caseMap[row.caseId].entries.push({
+        id: row.id,
+        userId: row.userId,
+        userName: row.userName,
+        userEmail: row.userEmail,
+        userProfileImage: row.userProfileImage,
+        feedback: row.feedback,
+        score: row.totalScore,
+        completedAt: row.completedAt
+      });
+    }
+
+    res.json(Object.values(caseMap));
+  } catch (err) {
+    console.error('Error fetching feedback:', err);
     res.status(500).json({ message: 'Database error' });
   }
 });
