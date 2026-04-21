@@ -2829,6 +2829,7 @@ app.get('/api/admin/overview', authMiddleware('admin'), async (req, res) => {
 
 // User Management
 app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
+  console.log(`[DEBUG_ID_101] GET /api/admin/users triggered`);
   try {
     const [rows] = await pool.query(
       `SELECT id, email, role, name, profileImage, phone, email_verified,
@@ -2838,11 +2839,21 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
        ORDER BY createdAt DESC`
     );
 
-    console.log(`[Users API] Fetching users with derived membership via getUserMembership...`);
-
     const users = await Promise.all(rows.map(async (row) => {
       // Get derived membership from active subscription
-      const membership = await getUserMembership(pool, row.id);
+      const membership = await getUserMembership(pool, row.id).catch(() => ({ membershipType: 'free' }));
+
+      // Fetch user performance statistics - renaming stats to userPerf
+      const [performanceRows] = await pool.query(
+        `SELECT 
+          SUM(CASE WHEN isCompleted = 1 OR completedAt IS NOT NULL THEN 1 ELSE 0 END) as casesCompleted,
+          SUM(totalScore) as totalScore
+         FROM user_case_progress
+         WHERE userId = ? AND (isCompleted = 1 OR completedAt IS NOT NULL)`,
+         [row.id]
+      ).catch(() => [[]]);
+      
+      const userPerf = (performanceRows && performanceRows[0]) ? performanceRows[0] : { casesCompleted: 0, totalScore: 0 };
 
       return {
         id: row.id,
@@ -2871,13 +2882,13 @@ app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
         profileImage: row.profileImage,
         phone: row.phone,
         email_verified: !!row.email_verified,
-        completedCases: stats[0]?.casesCompleted || 0,
-        totalPoints: stats[0]?.totalScore || 0,
+        completedCases: Number(userPerf.casesCompleted || 0),
+        totalPoints: Number(userPerf.totalScore || 0),
       };
     }));
     res.json(users);
   } catch (err) {
-    console.error('Error fetching users:', err);
+    console.error('Error fetching users [DEBUG_ID_101]:', err);
     res.status(500).json({ message: 'Database error' });
   }
 });
@@ -3468,17 +3479,6 @@ app.put('/api/admin/subscriptions/:id/cancel', authMiddleware('admin'), async (r
     );
 
     res.json({ message: 'Subscription cancelled and downgraded to Normal plan' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Database error', error: err.message });
-  }
-});
-
-// Add users listing if missing
-app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
-  try {
-    const [rows] = await pool.query(`SELECT id, name, email, role, phone, createdAt FROM users ORDER BY createdAt DESC`);
-    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Database error', error: err.message });
