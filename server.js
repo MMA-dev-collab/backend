@@ -351,6 +351,23 @@ async function runMigrations() {
       );
       console.log("✅ Migration: Added perfect_answer column to essay_questions table");
     }
+
+    // Migration: Add password reset columns to users table
+    const [resetCodeColumn] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME = 'password_reset_code'`,
+      [DB_CONFIG.database]
+    );
+
+    if (resetCodeColumn.length === 0) {
+      await pool.query(
+        `ALTER TABLE users 
+         ADD COLUMN password_reset_code VARCHAR(6) DEFAULT NULL,
+         ADD COLUMN password_reset_expires_at DATETIME DEFAULT NULL,
+         ADD COLUMN password_reset_attempts INT DEFAULT 0`
+      );
+      console.log("✅ Migration: Added password reset columns to users table");
+    }
   } catch (err) {
     console.error("⚠️ Migration failed:", err.message);
   }
@@ -1007,6 +1024,163 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: "Database error" });
+  }
+});
+
+/* ======================
+   FORGOT PASSWORD ROUTES
+====================== */
+const { sendPasswordResetEmail } = require('./utils/mailer-resend');
+
+// Password validation: min 8 chars, at least 1 uppercase, at least 1 number
+const PASSWORD_REGEX = /^(?=.*[A-Z])(?=.*\d).{8,}$/;
+
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: "Email is required" });
+
+  try {
+    const [rows] = await pool.query(`SELECT id, email FROM users WHERE email = ?`, [email.trim().toLowerCase()]);
+    const user = rows[0];
+
+    if (user) {
+      // Generate 6-digit code (100000–999999 guarantees 6 digits)
+      const resetCode = crypto.randomInt(100000, 999999).toString();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+      await pool.query(
+        `UPDATE users SET password_reset_code = ?, password_reset_expires_at = ?, password_reset_attempts = 0 WHERE id = ?`,
+        [resetCode, expiresAt, user.id]
+      );
+
+      // Send reset email (non-blocking — don't fail the request if email fails)
+      sendPasswordResetEmail(user.email, resetCode).catch(err => {
+        console.error("Failed to send password reset email:", err);
+      });
+    }
+
+    // Always return 200 — no user enumeration
+    res.json({ message: "If an account with that email exists, a reset code has been sent." });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    res.status(500).json({ message: "Something went wrong" });
+  }
+});
+
+app.post("/api/auth/verify-reset-code", authLimiter, async (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ message: "Email and code are required" });
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, password_reset_code, password_reset_expires_at, password_reset_attempts FROM users WHERE email = ?`,
+      [email.trim().toLowerCase()]
+    );
+    const user = rows[0];
+
+    if (!user || !user.password_reset_code) {
+      return res.status(400).json({ message: "No reset code found. Please request a new one." });
+    }
+
+    // Check if max attempts exceeded
+    if (user.password_reset_attempts >= 5) {
+      // Invalidate the code
+      await pool.query(
+        `UPDATE users SET password_reset_code = NULL, password_reset_expires_at = NULL, password_reset_attempts = 0 WHERE id = ?`,
+        [user.id]
+      );
+      return res.status(400).json({ message: "Too many failed attempts. Please request a new reset code." });
+    }
+
+    // Check expiry
+    if (new Date() > new Date(user.password_reset_expires_at)) {
+      await pool.query(
+        `UPDATE users SET password_reset_code = NULL, password_reset_expires_at = NULL, password_reset_attempts = 0 WHERE id = ?`,
+        [user.id]
+      );
+      return res.status(400).json({ message: "Reset code has expired. Please request a new one." });
+    }
+
+    // Check code
+    if (user.password_reset_code !== code) {
+      await pool.query(
+        `UPDATE users SET password_reset_attempts = password_reset_attempts + 1 WHERE id = ?`,
+        [user.id]
+      );
+      const remaining = 5 - (user.password_reset_attempts + 1);
+      return res.status(400).json({
+        message: `Invalid code. ${remaining > 0 ? `${remaining} attempt(s) remaining.` : 'Code invalidated. Please request a new one.'}`
+      });
+    }
+
+    // Code is correct — clear it immediately so it can't be reused
+    await pool.query(
+      `UPDATE users SET password_reset_code = NULL, password_reset_expires_at = NULL, password_reset_attempts = 0 WHERE id = ?`,
+      [user.id]
+    );
+
+    // Issue a short-lived reset token
+    const resetToken = jwt.sign(
+      { id: user.id, purpose: "password-reset" },
+      JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    res.json({ message: "Code verified", resetToken });
+  } catch (err) {
+    console.error("Verify reset code error:", err);
+    res.status(500).json({ message: "Something went wrong" });
+  }
+});
+
+app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
+  if (!pool) return res.status(503).json({ message: "DB unavailable" });
+
+  const { resetToken, newPassword } = req.body;
+  if (!resetToken || !newPassword) {
+    return res.status(400).json({ message: "Reset token and new password are required" });
+  }
+
+  // Validate password strength
+  if (!PASSWORD_REGEX.test(newPassword)) {
+    return res.status(400).json({
+      message: "Password must be at least 8 characters with at least 1 uppercase letter and 1 number"
+    });
+  }
+
+  try {
+    // Verify the reset token
+    const payload = jwt.verify(resetToken, JWT_SECRET);
+
+    if (payload.purpose !== "password-reset") {
+      return res.status(400).json({ message: "Invalid reset token" });
+    }
+
+    // Hash new password and update
+    const hash = bcrypt.hashSync(newPassword, 10);
+
+    await pool.query(
+      `UPDATE users SET passwordHash = ?, email_verified = TRUE, token_version = token_version + 1 WHERE id = ?`,
+      [hash, payload.id]
+    );
+
+    // Clear token version cache for this user
+    tokenVersionCache.delete(`token_v_${payload.id}`);
+
+    res.json({ message: "Password reset successful. You can now log in with your new password." });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(400).json({ message: "Reset token has expired. Please start over." });
+    }
+    if (err.name === 'JsonWebTokenError') {
+      return res.status(400).json({ message: "Invalid reset token" });
+    }
+    console.error("Reset password error:", err);
+    res.status(500).json({ message: "Something went wrong" });
   }
 });
 
