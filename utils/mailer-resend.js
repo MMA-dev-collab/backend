@@ -237,7 +237,7 @@ async function sendPasswordResetEmail(email, code) {
                                 <tr>
                                     <td align="center">
                                         <div style="width: 200px; height: 200px; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto;">
-                                            <img alt="TestNew" src="https://res.cloudinary.com/dhicz31vg/image/upload/v1770662884/WhatsApp_Image_2026-02-07_at_12.41.01_AM_x6qg6l.jpg">
+                                            <img style="width:100%; height:100%;" alt="TestNew" src="https://res.cloudinary.com/dhicz31vg/image/upload/v1770662884/WhatsApp_Image_2026-02-07_at_12.41.01_AM_x6qg6l.jpg">
                                         </div>
                                     </td>
                                 </tr>
@@ -262,7 +262,7 @@ async function sendPasswordResetEmail(email, code) {
                                             <p style="color: #475569; font-size: 14px; font-weight: 600; margin: 0 0 15px 0; text-transform: uppercase; letter-spacing: 1px;">
                                                 Your Reset Code
                                             </p>
-                                            <div style="font-size: 42px; font-weight: 700; letter-spacing: 10px; color: #dc2626; text-align: center; margin: 15px 0; font-family: 'Courier New', monospace;">
+                                            <div style="font-size: 42px; font-weight: 700; letter-spacing: 10px; color: #6366f1; text-align: center; margin: 15px 0; font-family: 'Courier New', monospace;">
                                                 ${code}
                                             </div>
                                             <p style="color: #94a3b8; font-size: 14px; margin: 15px 0 0 0;">
