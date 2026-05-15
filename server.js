@@ -368,6 +368,21 @@ async function runMigrations() {
       );
       console.log("✅ Migration: Added password reset columns to users table");
     }
+
+    // Migration: Add watermarkEnabled column to cases table
+    const [watermarkColumn] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cases' AND COLUMN_NAME = 'watermarkEnabled'`,
+      [DB_CONFIG.database]
+    );
+
+    if (watermarkColumn.length === 0) {
+      await pool.query(
+        `ALTER TABLE cases 
+         ADD COLUMN watermarkEnabled TINYINT(1) NOT NULL DEFAULT 1`
+      );
+      console.log("✅ Migration: Added watermarkEnabled column to cases table");
+    }
   } catch (err) {
     console.error("⚠️ Migration failed:", err.message);
   }
@@ -1885,6 +1900,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       patientData,
       thumbnailUrl: caseRow.thumbnailUrl,
       duration: caseRow.duration || 10,
+      watermarkEnabled: caseRow.watermarkEnabled !== undefined ? !!caseRow.watermarkEnabled : true,
       isCompleted,
       maxReachedIndex,
       activeSubStepId,
@@ -2497,7 +2513,8 @@ app.get('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       tag: row.tag,
       expected_time: row.expected_time,
       hint_text: row.hint_text,
-      hint_enabled: !!row.hint_enabled
+      hint_enabled: !!row.hint_enabled,
+      watermarkEnabled: row.watermarkEnabled !== undefined ? !!row.watermarkEnabled : true
     }));
     res.json(cases);
   } catch (err) {
@@ -2538,6 +2555,8 @@ app.get('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       requiredPlanId: row.requiredPlanId,
       requiredPlanName: row.requiredPlanName,
       requiredPlanRole: row.requiredPlanRole,
+      watermarkEnabled: row.watermarkEnabled !== undefined ? !!row.watermarkEnabled : true,
+      status: row.status || 'draft',
     };
     res.json(caseData);
   } catch (err) {
@@ -2549,12 +2568,13 @@ app.get('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
 app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
   const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, patientData, thumbnailUrl, duration } =
     req.body;
+  const watermarkEnabled = req.body.watermarkEnabled !== undefined ? req.body.watermarkEnabled : true;
   if (!title) return res.status(400).json({ message: 'Title is required' });
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, patientData, thumbnailUrl, duration, requiredPlanId, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')`,
+      `INSERT INTO cases (title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, patientData, thumbnailUrl, duration, requiredPlanId, status, watermarkEnabled)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)`,
       [
         title,
         specialty || null,
@@ -2567,7 +2587,8 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
         patientData ? JSON.stringify(patientData) : null,
         thumbnailUrl || null,
         duration || 10,
-        req.body.requiredPlanId || null
+        req.body.requiredPlanId || null,
+        watermarkEnabled ? 1 : 0
       ]
     );
 
@@ -2584,6 +2605,7 @@ app.post('/api/admin/cases', authMiddleware('admin'), async (req, res) => {
       thumbnailUrl,
       duration: duration || 10,
       status: 'draft',
+      watermarkEnabled: !!watermarkEnabled,
     });
   } catch (err) {
     console.error(err);
@@ -2595,6 +2617,7 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
   const { id } = req.params;
   const { title, specialty, category, categoryId, difficulty, isLocked, prerequisiteCaseId, metadata, thumbnailUrl, duration, status } =
     req.body;
+  const watermarkEnabled = req.body.watermarkEnabled;
 
   console.log(`[DEBUG] Updating case ${id}`, req.body); // DEBUG
   try {
@@ -2707,12 +2730,13 @@ app.put('/api/admin/cases/:id', authMiddleware('admin'), async (req, res) => {
       duration !== undefined ? duration : existingCase.duration,
       req.body.requiredPlanId !== undefined ? req.body.requiredPlanId : existingCase.requiredPlanId,
       status !== undefined ? status : existingCase.status,
+      watermarkEnabled !== undefined ? (watermarkEnabled ? 1 : 0) : existingCase.watermarkEnabled,
       id,
     ];
 
     await pool.query(
       `UPDATE cases
-       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, patientData = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?, status = ?
+       SET title = ?, specialty = ?, category = ?, categoryId = ?, difficulty = ?, isLocked = ?, prerequisiteCaseId = ?, metadata = ?, patientData = ?, thumbnailUrl = ?, duration = ?, requiredPlanId = ?, status = ?, watermarkEnabled = ?
        WHERE id = ?`,
       params
     );
