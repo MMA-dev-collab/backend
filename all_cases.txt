@@ -1,3 +1,0 @@
-id	title
-105	Neck Pain
-106	Bilateral knee pain
