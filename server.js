@@ -1960,32 +1960,72 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
   const { feedback } = req.body;
 
   try {
-    // 1. Calculate score based on user's attempts in step_attempts
-    const [attempts] = await pool.query(
-      `SELECT stepId, isCorrect FROM step_attempts 
-       WHERE caseId = ? AND userId = ?`, 
+    // 1. Get the latest attempt per step (with actual score)
+    const [latestAttempts] = await pool.query(
+      `SELECT sa.stepId, sa.score, sa.isCorrect
+       FROM step_attempts sa
+       INNER JOIN (
+         SELECT stepId, MAX(id) as maxId 
+         FROM step_attempts 
+         WHERE caseId = ? AND userId = ? 
+         GROUP BY stepId
+       ) latest ON sa.id = latest.maxId`,
       [caseId, userId]
     );
 
-    // Get max scores for the case
+    // 2. Get all steps with phase/category info to determine scorability
     const [steps] = await pool.query(
-      `SELECT id, type, maxScore, content FROM case_steps WHERE caseId = ?`,
+      `SELECT id, type, phase, category, maxScore, content FROM case_steps WHERE caseId = ?`,
       [caseId]
     );
+
+    // Phases and categories that make a 'clinical' step scorable
+    const SCORABLE_PHASES = new Set(['diagnosis', 'problem_list']);
+    const SCORABLE_CATEGORIES = new Set(['composite_assessment', 'composite_imaging']);
+
+    // Build a map of latest scores per step
+    const attemptScores = {};
+    latestAttempts.forEach(a => {
+      attemptScores[a.stepId] = { score: a.score, isCorrect: !!a.isCorrect };
+    });
 
     let totalScore = 0;
     let maxPossibleScore = 0;
 
-    const CORRECT_ATTEMPTS = new Set();
-    attempts.forEach(a => {
-      if (a.isCorrect) CORRECT_ATTEMPTS.add(a.stepId);
-    });
-
     for (const step of steps) {
-      if (step.type === 'mcq' || step.type === 'essay' || step.type === 'clinical') {
-        maxPossibleScore += (step.maxScore || 10);
-        if (CORRECT_ATTEMPTS.has(step.id)) {
-           totalScore += (step.maxScore || 10);
+      let isScorable = false;
+
+      if (step.type === 'mcq' || step.type === 'essay') {
+        isScorable = true;
+      } else if (step.type === 'clinical') {
+        // Only specific clinical phases/categories are scorable
+        if (SCORABLE_PHASES.has(step.phase) || SCORABLE_CATEGORIES.has(step.category)) {
+          isScorable = true;
+        } else {
+          // Check if content has scorable sections (composite steps with MCQ/essay)
+          let content = step.content;
+          if (typeof content === 'string') {
+            try { content = JSON.parse(content); } catch(e) { content = null; }
+          }
+          if (content?.sections?.some(s => s.type === 'mcq' || s.type === 'essay')) {
+            isScorable = true;
+          }
+        }
+      }
+
+      if (isScorable) {
+        const stepMax = step.maxScore || 10;
+        maxPossibleScore += stepMax;
+
+        // Use actual recorded score from step_attempts
+        const attempt = attemptScores[step.id];
+        if (attempt) {
+          if (attempt.score !== null && attempt.score !== undefined) {
+            totalScore += Math.min(attempt.score, stepMax);
+          } else if (attempt.isCorrect) {
+            // Fallback for MCQ attempts that may not store a numeric score
+            totalScore += stepMax;
+          }
         }
       }
     }
