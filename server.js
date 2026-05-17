@@ -1981,7 +1981,7 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
 
     // Phases and categories that make a 'clinical' step scorable
     const SCORABLE_PHASES = new Set(['diagnosis', 'problem_list']);
-    const SCORABLE_CATEGORIES = new Set(['composite_assessment', 'composite_imaging']);
+    const SCORABLE_CATEGORIES = new Set();
 
     // Build a map of latest scores per step
     const attemptScores = {};
