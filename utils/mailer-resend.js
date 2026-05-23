@@ -170,14 +170,14 @@ async function sendVerificationEmail(email, code) {
     });
 
     if (error) {
-      console.error("Resend API error:", error);
+      console.error(`[MAILER] [ERROR] [${new Date().toISOString()}] Resend API error for ${email}:`, error);
       return false;
     }
 
-    console.log("Message sent via Resend: %s", data.id);
+    console.log(`[MAILER] [SUCCESS] [${new Date().toISOString()}] Verification email sent to ${email}. ID: ${data.id}`);
     return true;
   } catch (error) {
-    console.error("Error sending email via Resend:", error);
+    console.error(`[MAILER] [CRITICAL] [${new Date().toISOString()}] Error sending verification email to ${email}:`, error);
     return false;
   }
 }
@@ -327,14 +327,14 @@ async function sendPasswordResetEmail(email, code) {
     });
 
     if (error) {
-      console.error("Resend API error (password reset):", error);
+      console.error(`[MAILER] [ERROR] [${new Date().toISOString()}] Resend API error (password reset) for ${email}:`, error);
       return false;
     }
 
-    console.log("Password reset email sent via Resend: %s", data.id);
+    console.log(`[MAILER] [SUCCESS] [${new Date().toISOString()}] Password reset email sent to ${email}. ID: ${data.id}`);
     return true;
   } catch (error) {
-    console.error("Error sending password reset email via Resend:", error);
+    console.error(`[MAILER] [CRITICAL] [${new Date().toISOString()}] Error sending password reset email to ${email}:`, error);
     return false;
   }
 }

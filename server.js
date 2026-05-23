@@ -1057,6 +1057,7 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   if (!email) return res.status(400).json({ message: "Email is required" });
 
   try {
+    console.log(`[AUTH] Forgot password requested for: ${email}`);
     const [rows] = await pool.query(`SELECT id, email FROM users WHERE email = ?`, [email.trim().toLowerCase()]);
     const user = rows[0];
 
@@ -1065,21 +1066,26 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
       const resetCode = crypto.randomInt(100000, 999999).toString();
       const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
+      console.log(`[AUTH] Generating reset code for userId: ${user.id}`);
       await pool.query(
         `UPDATE users SET password_reset_code = ?, password_reset_expires_at = ?, password_reset_attempts = 0 WHERE id = ?`,
         [resetCode, expiresAt, user.id]
       );
 
-      // Send reset email (non-blocking — don't fail the request if email fails)
-      sendPasswordResetEmail(user.email, resetCode).catch(err => {
-        console.error("Failed to send password reset email:", err);
+      // Send reset email (Await it to ensure it's sent before finishing the request)
+      console.log(`[AUTH] Attempting to send password reset email to: ${user.email}`);
+      await sendPasswordResetEmail(user.email, resetCode).catch(err => {
+        console.error(`[AUTH] [CRITICAL] Failed to send password reset email to ${user.email}:`, err);
+        // We still return 200 to avoid enumeration, but log the failure
       });
+    } else {
+      console.log(`[AUTH] Forgot password requested for non-existent email: ${email}`);
     }
 
     // Always return 200 — no user enumeration
     res.json({ message: "If an account with that email exists, a reset code has been sent." });
   } catch (err) {
-    console.error("Forgot password error:", err);
+    console.error(`[AUTH] Forgot password error for ${email}:`, err);
     res.status(500).json({ message: "Something went wrong" });
   }
 });
@@ -1518,7 +1524,7 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
 
     res.json({
       casesCompleted: currentCasesCompleted,
-      totalScore: currentTotalScore,
+      totalScore: Math.round(currentTotalScore),
       rank,
       membershipType: membership.membershipType,
       membershipExpiresAt: membership.membershipExpiresAt,
@@ -2021,7 +2027,7 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
         const attempt = attemptScores[step.id];
         if (attempt) {
           if (attempt.score !== null && attempt.score !== undefined) {
-            totalScore += Math.min(attempt.score, stepMax);
+            totalScore += Math.round(Math.min(attempt.score, stepMax));
           } else if (attempt.isCorrect) {
             // Fallback for MCQ attempts that may not store a numeric score
             totalScore += stepMax;
@@ -2345,7 +2351,7 @@ app.post(
 
         // Calculate score for this question
         const questionScore = keywords.length > 0
-          ? (matchedKeywords.length / keywords.length) * (eq.max_score || 10)
+          ? Math.round((matchedKeywords.length / keywords.length) * (eq.max_score || 10))
           : (eq.max_score || 10); // Award full marks if no keywords defined
 
         totalScore += questionScore;
@@ -2359,7 +2365,7 @@ app.post(
       const stepMaxScore = stepRows[0]?.maxScore || 10;
 
       // Normalize score to step's maxScore
-      const finalScore = Math.min(totalScore, stepMaxScore);
+      const finalScore = Math.round(Math.min(totalScore, stepMaxScore));
       const isCorrect = finalScore >= (stepMaxScore * 0.6); // 60% threshold
 
       // Build feedback text (same logic used in the response below)
@@ -2487,7 +2493,7 @@ app.post(
 
       const [stepRows] = await pool.query(`SELECT maxScore FROM case_steps WHERE id = ?`, [stepId]);
       const stepMaxScore = stepRows[0]?.maxScore || 10;
-      const finalScore = evalScore || 0;
+      const finalScore = Math.round(evalScore || 0);
       const isCorrect = finalScore >= (stepMaxScore * 0.6);
 
       await pool.query(
@@ -4024,7 +4030,7 @@ app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
       userId: r.userId,
       email: r.email,
       casesCompleted: Number(r.casesCompleted) || 0,
-      totalScore: Number(r.totalScore) || 0
+      totalScore: Math.round(Number(r.totalScore) || 0)
     }));
 
     res.json(leaderboard);
@@ -4090,7 +4096,7 @@ app.get('/api/profile/stats', authMiddleware(), async (req, res) => {
 
     res.json({
       casesCompleted: currentCasesCompleted,
-      totalScore: currentTotalScore,
+      totalScore: Math.round(currentTotalScore),
       rank,
       membershipType: userRows[0].membershipType,
       membershipExpiresAt: subRows.length > 0 ? subRows[0].endDate : null,
