@@ -4014,12 +4014,12 @@ app.get('/api/steps/:stepId/hint', authMiddleware(), async (req, res) => {
 app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT u.id as userId, u.email, 
+      `SELECT u.id as userId, u.email, u.name, u.profileImage,
               SUM(CASE WHEN ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL THEN 1 ELSE 0 END) as casesCompleted, 
               SUM(ucp.totalScore) as totalScore
        FROM users u
        JOIN user_case_progress ucp ON u.id = ucp.userId
-       GROUP BY u.id, u.email
+       GROUP BY u.id, u.email, u.name, u.profileImage
        HAVING casesCompleted > 0
        ORDER BY totalScore DESC, casesCompleted DESC
        LIMIT 100`
@@ -4029,6 +4029,8 @@ app.get('/api/leaderboard', authMiddleware(), async (req, res) => {
       rank: index + 1,
       userId: r.userId,
       email: r.email,
+      name: r.name,
+      profileImage: r.profileImage,
       casesCompleted: Number(r.casesCompleted) || 0,
       totalScore: Math.round(Number(r.totalScore) || 0)
     }));
