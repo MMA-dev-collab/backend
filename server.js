@@ -1728,6 +1728,13 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
 app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
   const caseId = req.params.id;
   try {
+    // --- SPRINT CUSTOMIZATION: Always wipe progress and attempts on case load to start fresh ---
+    if (req.user && req.user.id) {
+      await pool.query(`DELETE FROM user_case_progress WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
+      await pool.query(`DELETE FROM step_attempts WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
+    }
+    // --- END OF SPRINT CUSTOMIZATION ---
+
     const [caseRows] = await pool.query(`SELECT * FROM cases WHERE id = ?`, [caseId]);
     const caseRow = caseRows[0];
 
@@ -1910,14 +1917,30 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       );
       if (progRows.length > 0) {
         const p = progRows[0];
-        isCompleted = !!p.isCompleted;
-        currentStepIndex = p.currentStepIndex || 0;
-        maxReachedIndex = p.maxReachedIndex || 0;
-        activeSubStepId = p.activeSubStepId;
         
-        try { completedSubSteps = p.completedSubSteps ? (typeof p.completedSubSteps === 'string' ? JSON.parse(p.completedSubSteps) : p.completedSubSteps) : []; } catch(e){}
-        try { hubProgress = p.hubProgress ? (typeof p.hubProgress === 'string' ? JSON.parse(p.hubProgress) : p.hubProgress) : {}; } catch(e){}
-        var savedFeedback = p.feedback || '';
+        // --- SPRINT CUSTOMIZATION: Comment out Review Case restriction to allow starting over ---
+        // If the case is completed, delete the progress so the user starts a fresh run.
+        if (p.isCompleted) {
+          await pool.query(`DELETE FROM user_case_progress WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
+          await pool.query(`DELETE FROM step_attempts WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
+          isCompleted = false;
+          currentStepIndex = 0;
+          maxReachedIndex = 0;
+          activeSubStepId = null;
+          completedSubSteps = [];
+          hubProgress = {};
+          var savedFeedback = '';
+        } else {
+          isCompleted = !!p.isCompleted;
+          currentStepIndex = p.currentStepIndex || 0;
+          maxReachedIndex = p.maxReachedIndex || 0;
+          activeSubStepId = p.activeSubStepId;
+          
+          try { completedSubSteps = p.completedSubSteps ? (typeof p.completedSubSteps === 'string' ? JSON.parse(p.completedSubSteps) : p.completedSubSteps) : []; } catch(e){}
+          try { hubProgress = p.hubProgress ? (typeof p.hubProgress === 'string' ? JSON.parse(p.hubProgress) : p.hubProgress) : {}; } catch(e){}
+          var savedFeedback = p.feedback || '';
+        }
+        // --- END OF SPRINT CUSTOMIZATION ---
       }
     }
 
@@ -1959,6 +1982,8 @@ app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
   const userId = req.user.id;
 
   try {
+    // --- SPRINT CUSTOMIZATION: Disable saving intermediate progress in the database ---
+    /*
     await pool.query(
       `INSERT INTO user_case_progress (userId, caseId, currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1978,6 +2003,8 @@ app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
         maxReachedIndex || 0
       ]
     );
+    */
+    // --- END OF SPRINT CUSTOMIZATION ---
 
     res.json({ success: true });
   } catch (err) {
@@ -2063,7 +2090,8 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
       }
     }
 
-    // 2. Mark as completed (with optional feedback)
+    // --- SPRINT CUSTOMIZATION: Disable saving completion progress in the database ---
+    /*
     await pool.query(
       `INSERT INTO user_case_progress (userId, caseId, isCompleted, completedAt, totalScore, feedback)
        VALUES (?, ?, 1, NOW(), ?, ?)
@@ -2074,6 +2102,8 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
          feedback = COALESCE(?, feedback)`,
       [userId, caseId, totalScore, feedback || null, totalScore, feedback || null]
     );
+    */
+    // --- END OF SPRINT CUSTOMIZATION ---
 
     res.json({
       success: true,
