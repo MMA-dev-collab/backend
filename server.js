@@ -206,28 +206,8 @@ app.post('/api/upload', authMiddleware('admin'), uploadLimiter, uploadMiddleware
 });
 
 app.post('/api/cases/log-image-access', authMiddleware(), async (req, res) => {
-  try {
-    const { imageUrl, caseId, stepId } = req.body;
-    const userId = req.user.id || req.user._id || 'unknown';
-    const userEmail = req.user.email || 'unknown';
-    const clientIP = getClientIP(req);
-    const fingerprint = getDeviceFingerprint(req);
-    const deviceType = getDeviceType(req);
-    const now = new Date().toISOString();
-
-    const logMessage = `[${now}] USER: ${userId} (${userEmail}) | IMAGE: ${imageUrl} | CASE: ${caseId || 'N/A'} | STEP: ${stepId || 'N/A'} | IP: ${clientIP} | FINGERPRINT: ${fingerprint} | DEVICE: ${deviceType}\n`;
-
-    const logDir = path.join(__dirname, 'logs');
-    if (!fs.existsSync(logDir)) {
-      fs.mkdirSync(logDir, { recursive: true });
-    }
-    fs.appendFileSync(path.join(logDir, 'image_access.log'), logMessage);
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Failed to log image access:', error);
-    res.status(500).json({ message: 'Logging failed', error: error.message });
-  }
+  // Feature disabled
+  return res.json({ success: true, message: 'Feature disabled' });
 });
 
 
