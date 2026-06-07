@@ -390,12 +390,65 @@ async function runMigrations() {
       );
       console.log("✅ Migration: Added watermarkEnabled column to cases table");
     }
+
+    // --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+    // Add sessionId column to user_case_progress for per-browser progress tracking
+    const [sessionIdCol] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'user_case_progress' AND COLUMN_NAME = 'sessionId'`,
+      [DB_CONFIG.database]
+    );
+
+    if (sessionIdCol.length === 0) {
+      await pool.query(`ALTER TABLE user_case_progress ADD COLUMN sessionId VARCHAR(36) DEFAULT NULL AFTER userId`);
+      // Drop old unique constraint and add session-based one
+      try {
+        await pool.query(`ALTER TABLE user_case_progress DROP INDEX unique_user_case`);
+      } catch (e) { /* constraint may not exist */ }
+      await pool.query(`ALTER TABLE user_case_progress ADD UNIQUE KEY unique_session_case (sessionId, caseId)`);
+      console.log("✅ Migration: Added sessionId column to user_case_progress");
+    }
+
+    // Add sessionId column to step_attempts
+    const [attemptsSessionCol] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'step_attempts' AND COLUMN_NAME = 'sessionId'`,
+      [DB_CONFIG.database]
+    );
+
+    if (attemptsSessionCol.length === 0) {
+      await pool.query(`ALTER TABLE step_attempts ADD COLUMN sessionId VARCHAR(36) DEFAULT NULL AFTER userId`);
+      await pool.query(`CREATE INDEX idx_attempts_session ON step_attempts(sessionId, caseId)`);
+      console.log("✅ Migration: Added sessionId column to step_attempts");
+    }
+
+    // Add feedback column to user_case_progress if missing
+    const [feedbackCol] = await pool.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'user_case_progress' AND COLUMN_NAME = 'feedback'`,
+      [DB_CONFIG.database]
+    );
+    if (feedbackCol.length === 0) {
+      await pool.query(`ALTER TABLE user_case_progress ADD COLUMN feedback TEXT DEFAULT NULL`);
+      console.log("✅ Migration: Added feedback column to user_case_progress");
+    }
+    // --- END SPRINT CUSTOMIZATION: Session-based progress isolation ---
   } catch (err) {
     console.error("⚠️ Migration failed:", err.message);
   }
 }
 
 connectDatabase();
+
+// --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+// Extracts the browser-specific session ID from the X-Session-Id header.
+// Each browser generates a UUID on first visit (stored in localStorage).
+// This allows multiple users on the same account to have separate progress.
+// REVERT: Remove this function and revert all sessionId references back to userId.
+function getSessionId(req) {
+  return req.headers['x-session-id'] || null;
+}
+// --- END SPRINT CUSTOMIZATION ---
 
 /* ======================
    SQLITE-COMPAT DB API
@@ -1619,7 +1672,11 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
     const total = countRows[0].total;
     const totalPages = Math.ceil(total / limit);
 
-    const isCompletedSelect = userId ? `(SELECT 1 FROM user_case_progress ucp WHERE ucp.caseId = c.id AND ucp.userId = ? AND (ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL) LIMIT 1)` : '0';
+    // --- SPRINT CUSTOMIZATION: Use sessionId for isCompleted check ---
+    // ORIGINAL: const isCompletedSelect = userId ? `(SELECT 1 FROM user_case_progress ucp WHERE ucp.caseId = c.id AND ucp.userId = ? AND (ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL) LIMIT 1)` : '0';
+    const sessionId = getSessionId(req);
+    const isCompletedSelect = sessionId ? `(SELECT 1 FROM user_case_progress ucp WHERE ucp.caseId = c.id AND ucp.sessionId = ? AND (ucp.isCompleted = 1 OR ucp.completedAt IS NOT NULL) LIMIT 1)` : '0';
+    // --- END SPRINT CUSTOMIZATION ---
 
     const query = `SELECT c.*, cat.name as categoryName, cat.icon as categoryIcon,
       sp.name as requiredPlanName, sp.role as requiredPlanRole,
@@ -1632,9 +1689,12 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
      LIMIT ? OFFSET ?`;
     
     // params array construction depends on if we used userId
-    const params = userId 
-      ? [userId, ...filterParams, limit, offset] 
+    // --- SPRINT CUSTOMIZATION: Use sessionId instead of userId ---
+    // ORIGINAL: const params = userId ? [userId, ...filterParams, limit, offset] : [...filterParams, limit, offset];
+    const params = sessionId 
+      ? [sessionId, ...filterParams, limit, offset] 
       : [...filterParams, limit, offset];
+    // --- END SPRINT CUSTOMIZATION ---
 
     const [rows] = await pool.query(query, params);
 
@@ -1708,12 +1768,12 @@ app.get('/api/cases', searchLimiter, async (req, res) => {
 app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
   const caseId = req.params.id;
   try {
-    // --- SPRINT CUSTOMIZATION: Always wipe progress and attempts on case load to start fresh ---
-    if (req.user && req.user.id) {
-      await pool.query(`DELETE FROM user_case_progress WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
-      await pool.query(`DELETE FROM step_attempts WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
-    }
-    // --- END OF SPRINT CUSTOMIZATION ---
+    // --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+    // REMOVED: The old "wipe all progress on load" override is no longer needed.
+    // Progress is now keyed by sessionId (browser UUID) instead of userId,
+    // so each browser naturally gets its own clean progress.
+    const sessionId = getSessionId(req);
+    // --- END SPRINT CUSTOMIZATION ---
 
     const [caseRows] = await pool.query(`SELECT * FROM cases WHERE id = ?`, [caseId]);
     const caseRow = caseRows[0];
@@ -1847,14 +1907,16 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
       hint_enabled: !!s.hint_enabled
     }));
 
-    // Load attempts if user is logged in
+    // --- SPRINT CUSTOMIZATION: Load attempts by sessionId instead of userId ---
+    // ORIGINAL: WHERE caseId = ? AND userId = ?
     const [attempts] = await pool.query(
       `SELECT stepId, selectedOptionId, isCorrect, attemptNumber, essay_answer, answer_data, score 
        FROM step_attempts 
-       WHERE caseId = ? AND userId = ?
+       WHERE caseId = ? AND sessionId = ?
        ORDER BY attemptNumber DESC`, // Get latest attempts
-      [caseId, req.user.id]
+      [caseId, sessionId]
     );
+    // --- END SPRINT CUSTOMIZATION ---
 
     // Create a map of latest attempts per step
     const latestAttempts = {};
@@ -1890,19 +1952,21 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
     let completedSubSteps = [];
     let hubProgress = {};
 
-    if (req.user && req.user.id) {
+    // --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+    // ORIGINAL: WHERE userId = ? AND caseId = ?, [req.user.id, caseId]
+    if (sessionId) {
       const [progRows] = await pool.query(
-        `SELECT * FROM user_case_progress WHERE userId = ? AND caseId = ?`,
-        [req.user.id, caseId]
+        `SELECT * FROM user_case_progress WHERE sessionId = ? AND caseId = ?`,
+        [sessionId, caseId]
       );
       if (progRows.length > 0) {
         const p = progRows[0];
         
-        // --- SPRINT CUSTOMIZATION: Comment out Review Case restriction to allow starting over ---
+        // SPRINT CUSTOMIZATION: Comment out Review Case restriction to allow starting over
         // If the case is completed, delete the progress so the user starts a fresh run.
         if (p.isCompleted) {
-          await pool.query(`DELETE FROM user_case_progress WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
-          await pool.query(`DELETE FROM step_attempts WHERE userId = ? AND caseId = ?`, [req.user.id, caseId]);
+          await pool.query(`DELETE FROM user_case_progress WHERE sessionId = ? AND caseId = ?`, [sessionId, caseId]);
+          await pool.query(`DELETE FROM step_attempts WHERE sessionId = ? AND caseId = ?`, [sessionId, caseId]);
           isCompleted = false;
           currentStepIndex = 0;
           maxReachedIndex = 0;
@@ -1920,9 +1984,10 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
           try { hubProgress = p.hubProgress ? (typeof p.hubProgress === 'string' ? JSON.parse(p.hubProgress) : p.hubProgress) : {}; } catch(e){}
           var savedFeedback = p.feedback || '';
         }
-        // --- END OF SPRINT CUSTOMIZATION ---
+        // END SPRINT CUSTOMIZATION
       }
     }
+    // --- END SPRINT CUSTOMIZATION: Session-based progress ---
 
     res.json({
       id: caseRow.id,
@@ -1959,14 +2024,25 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
 app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
   const { caseId } = req.params;
   const { currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex } = req.body;
+  // --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+  // ORIGINAL: const userId = req.user.id; — progress was keyed by userId
+  // Now keyed by sessionId (browser UUID) for multi-user shared account support.
+  // REVERT: Replace sessionId with userId in the query and remove getSessionId call.
+  const sessionId = getSessionId(req);
   const userId = req.user.id;
+  // --- END SPRINT CUSTOMIZATION ---
+
+  if (!sessionId) {
+    return res.json({ success: true }); // No session = no progress to save
+  }
 
   try {
-    // --- SPRINT CUSTOMIZATION: Disable saving intermediate progress in the database ---
-    /*
+    // --- SPRINT CUSTOMIZATION: Use sessionId instead of userId ---
+    // ORIGINAL: INSERT INTO user_case_progress (userId, caseId, ...) VALUES (userId, ...)
+    //           ON DUPLICATE KEY UPDATE ... (unique on userId+caseId)
     await pool.query(
-      `INSERT INTO user_case_progress (userId, caseId, currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO user_case_progress (userId, sessionId, caseId, currentStepIndex, activeSubStepId, completedSubSteps, hubProgress, maxReachedIndex)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE 
          currentStepIndex = VALUES(currentStepIndex),
          activeSubStepId = VALUES(activeSubStepId),
@@ -1974,7 +2050,8 @@ app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
          hubProgress = VALUES(hubProgress),
          maxReachedIndex = GREATEST(maxReachedIndex, VALUES(maxReachedIndex))`,
       [
-        userId, 
+        userId,
+        sessionId,
         caseId, 
         currentStepIndex || 0,
         activeSubStepId || null,
@@ -1983,8 +2060,7 @@ app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
         maxReachedIndex || 0
       ]
     );
-    */
-    // --- END OF SPRINT CUSTOMIZATION ---
+    // --- END SPRINT CUSTOMIZATION ---
 
     res.json({ success: true });
   } catch (err) {
@@ -1998,6 +2074,7 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
   const { caseId } = req.params;
   const userId = req.user.id;
   const { feedback } = req.body;
+  const sessionId = getSessionId(req);
 
   try {
     // 1. Get the latest attempt per step (with actual score)
@@ -2007,10 +2084,10 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
        INNER JOIN (
          SELECT stepId, MAX(id) as maxId 
          FROM step_attempts 
-         WHERE caseId = ? AND userId = ? 
+         WHERE caseId = ? AND sessionId = ? 
          GROUP BY stepId
        ) latest ON sa.id = latest.maxId`,
-      [caseId, userId]
+      [caseId, sessionId]
     );
 
     // 2. Get all steps with phase/category info to determine scorability
@@ -2070,20 +2147,22 @@ app.post('/api/cases/:caseId/complete', authMiddleware(), async (req, res) => {
       }
     }
 
-    // --- SPRINT CUSTOMIZATION: Disable saving completion progress in the database ---
-    /*
-    await pool.query(
-      `INSERT INTO user_case_progress (userId, caseId, isCompleted, completedAt, totalScore, feedback)
-       VALUES (?, ?, 1, NOW(), ?, ?)
-       ON DUPLICATE KEY UPDATE 
-         isCompleted = 1,
-         completedAt = NOW(),
-         totalScore = ?,
-         feedback = COALESCE(?, feedback)`,
-      [userId, caseId, totalScore, feedback || null, totalScore, feedback || null]
-    );
-    */
-    // --- END OF SPRINT CUSTOMIZATION ---
+    // --- SPRINT CUSTOMIZATION: Use sessionId for completion progress ---
+    // ORIGINAL: INSERT INTO user_case_progress (userId, caseId, ...) VALUES (userId, caseId, ...)
+    // REVERT: Remove sessionId from the INSERT and replace with userId-only keying.
+    if (sessionId) {
+      await pool.query(
+        `INSERT INTO user_case_progress (userId, sessionId, caseId, isCompleted, completedAt, totalScore, feedback)
+         VALUES (?, ?, ?, 1, NOW(), ?, ?)
+         ON DUPLICATE KEY UPDATE 
+           isCompleted = 1,
+           completedAt = NOW(),
+           totalScore = ?,
+           feedback = COALESCE(?, feedback)`,
+        [userId, sessionId, caseId, totalScore, feedback || null, totalScore, feedback || null]
+      );
+    }
+    // --- END SPRINT CUSTOMIZATION ---
 
     res.json({
       success: true,
@@ -2172,14 +2251,17 @@ app.post(
           isCorrect,
           feedback: feedback || null
         };
+        // --- SPRINT CUSTOMIZATION: Include sessionId in step_attempts ---
+        const sessionId = getSessionId(req);
         await pool.query(
-          `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, answer_data)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO step_attempts (userId, sessionId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, answer_data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.id,
+            sessionId,
             caseId,
             stepId,
-            isNaN(selectedOptionId) ? null : Number(selectedOptionId), // Null if string like 'a' for composite options
+            isNaN(selectedOptionId) ? null : Number(selectedOptionId),
             isCorrect ? 1 : 0,
             timeSpent || 0,
             hintShown ? 1 : 0,
@@ -2187,6 +2269,7 @@ app.post(
             JSON.stringify(mcqAnswerData)
           ]
         );
+        // --- END SPRINT CUSTOMIZATION ---
       } catch (attemptErr) {
         // Log but don't fail the main request if attempt tracking fails
         console.error('Failed to record step attempt:', attemptErr);
@@ -2202,18 +2285,20 @@ app.post(
       if (isFinalStep) {
         // Calculate total score dynamically (Scoring Fix)
         // Only count correct attempts on MCQ steps
+        // --- SPRINT CUSTOMIZATION: Use sessionId for final score query ---
         const [scoreRows] = await pool.query(
           `SELECT SUM(cs.maxScore) as totalScore
            FROM step_attempts sa
            JOIN case_steps cs ON sa.stepId = cs.id
-           WHERE sa.caseId = ? AND sa.userId = ? AND cs.type = 'mcq' AND sa.isCorrect = 1
+           WHERE sa.caseId = ? AND sa.sessionId = ? AND cs.type = 'mcq' AND sa.isCorrect = 1
            AND sa.id IN (
                SELECT MAX(id) FROM step_attempts 
-               WHERE caseId = ? AND userId = ? 
+               WHERE caseId = ? AND sessionId = ? 
                GROUP BY stepId
            )`,
-          [caseId, req.user.id, caseId, req.user.id]
+          [caseId, sessionId, caseId, sessionId]
         );
+        // --- END SPRINT CUSTOMIZATION ---
         const score = scoreRows[0].totalScore || 0;
         res.json({
           correct: true,
@@ -2246,6 +2331,9 @@ app.post(
     const { caseId, stepId } = req.params;
 
     try {
+      // --- SPRINT CUSTOMIZATION: Session-based progress isolation ---
+      const sessionId = getSessionId(req);
+      // --- END SPRINT CUSTOMIZATION ---
       // Fetch essay questions for this step
       let [essayQuestions] = await pool.query(
         `SELECT * FROM essay_questions WHERE step_id = ?`,
@@ -2422,14 +2510,15 @@ app.post(
       answerData.feedback = feedbackText;
       answerData.essayScore = finalScore;
 
-      // For composite steps: merge any existing MCQ attempt data so both MCQ+Essay survive
+      // --- SPRINT CUSTOMIZATION: Use sessionId for merge query ---
       try {
         const [existingAttempts] = await pool.query(
           `SELECT answer_data FROM step_attempts 
-           WHERE userId = ? AND caseId = ? AND stepId = ? AND selectedOptionId IS NOT NULL
+           WHERE sessionId = ? AND caseId = ? AND stepId = ? AND selectedOptionId IS NOT NULL
            ORDER BY id DESC LIMIT 1`,
-          [req.user.id, caseId, stepId]
+          [sessionId, caseId, stepId]
         );
+      // --- END SPRINT CUSTOMIZATION ---
         if (existingAttempts.length > 0 && existingAttempts[0].answer_data) {
           try {
             const mcqData = typeof existingAttempts[0].answer_data === 'string' 
@@ -2445,13 +2534,14 @@ app.post(
         console.error('Failed to merge MCQ data for composite step:', mergeErr);
       }
 
-      // Record the attempt
+      // --- SPRINT CUSTOMIZATION: Include sessionId in essay step_attempts ---
       await pool.query(
         `INSERT INTO step_attempts 
-         (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score)
-         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (userId, sessionId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           req.user.id,
+          sessionId,
           caseId,
           stepId,
           isCorrect ? 1 : 0,
@@ -2464,6 +2554,7 @@ app.post(
           finalScore
         ]
       );
+      // --- END SPRINT CUSTOMIZATION ---
 
       // If final step, update progress
       if (isFinalStep) {
@@ -2533,10 +2624,13 @@ app.post(
       const finalScore = Math.round(evalScore || 0);
       const isCorrect = finalScore >= (stepMaxScore * 0.6);
 
+      // --- SPRINT CUSTOMIZATION: Include sessionId in structural step_attempts ---
+      const sessionId = getSessionId(req);
       await pool.query(
-        `INSERT INTO step_attempts (userId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.id, caseId, stepId, isCorrect ? 1 : 0, timeSpent || 0, hintShown ? 1 : 0, attemptNumber || 1, essayAnswer, '[]', JSON.stringify(answerData), finalScore]
+        `INSERT INTO step_attempts (userId, sessionId, caseId, stepId, selectedOptionId, isCorrect, timeSpent, hintShown, attemptNumber, essay_answer, matched_keywords, answer_data, score) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.id, sessionId, caseId, stepId, isCorrect ? 1 : 0, timeSpent || 0, hintShown ? 1 : 0, attemptNumber || 1, essayAnswer, '[]', JSON.stringify(answerData), finalScore]
       );
+      // --- END SPRINT CUSTOMIZATION ---
 
       if (isFinalStep) {
         res.json({ correct: isCorrect, final: true, score: finalScore, maxScore: stepMaxScore, feedback: answerData.feedback, stats: { casesCompleted: 0, totalScore: 0 } });
@@ -2550,10 +2644,10 @@ app.post(
   }
 );
 
-// Save step progress for mid-case resume
-app.put('/api/cases/:caseId/progress', authMiddleware(), async (req, res) => {
-  res.json({ message: 'Progress saved', currentStepIndex: req.body.currentStepIndex || 0 });
-});
+// --- SPRINT CUSTOMIZATION: Removed duplicate no-op PUT /api/cases/:caseId/progress route ---
+// The active route is defined above (around line 2024). This dead code duplicate has been removed.
+// REVERT: No action needed; this was dead code.
+// --- END SPRINT CUSTOMIZATION ---
 
 app.get('/api/stats/me', authMiddleware(), async (req, res) => {
   res.json({
