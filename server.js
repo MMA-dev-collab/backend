@@ -2363,7 +2363,7 @@ app.post(
                 keywords: JSON.stringify(sec.expectedKeywords || []),
                 synonyms: '[]',
                 perfect_answer: sec.perfectAnswer || '',
-                max_score: 10
+                max_score: sec.maxScore || sec.max_score || 10
               }));
             }
           }
