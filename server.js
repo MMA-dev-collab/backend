@@ -1919,7 +1919,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
     // --- END SPRINT CUSTOMIZATION ---
 
     // Create a map of latest attempts per step
-    const latestAttempts = {};
+    let latestAttempts = {};
     attempts.forEach(a => {
       // Since we ordered by DESC, the first one we see is the latest
       if (!latestAttempts[a.stepId]) {
@@ -1974,6 +1974,7 @@ app.get('/api/cases/:id', authMiddleware(), async (req, res) => {
           completedSubSteps = [];
           hubProgress = {};
           var savedFeedback = '';
+          latestAttempts = {}; // SPRINT CUSTOMIZATION: Clear local attempts for completed cases being restarted
         } else {
           isCompleted = !!p.isCompleted;
           currentStepIndex = p.currentStepIndex || 0;
